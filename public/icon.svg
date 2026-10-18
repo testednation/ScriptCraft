@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#1e293b" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+    <linearGradient id="nib" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8fafc" />
+      <stop offset="100%" stop-color="#cbd5e1" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- Caligraphic stroke swoosh -->
+  <path d="M 120 380 C 180 320, 240 400, 320 350 C 370 320, 390 280, 380 230 C 370 170, 280 160, 220 200 C 160 240, 150 310, 200 350 C 250 390, 340 370, 390 320" 
+        fill="none" stroke="url(#accent)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+  <!-- Fountain Pen Nib -->
+  <g transform="translate(256, 210) rotate(-45) translate(-60, -100)">
+    <path d="M 40 0 L 80 0 L 100 80 L 60 160 L 20 80 Z" fill="url(#nib)"/>
+    <path d="M 60 40 L 60 120" stroke="#0f172a" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="60" cy="80" r="7" fill="#0f172a"/>
+    <path d="M 45 10 L 75 10 L 70 30 L 50 30 Z" fill="url(#accent)"/>
+  </g>
+  <!-- Stylized font letter S -->
+  <text x="256" y="440" font-family="system-ui, -apple-system, sans-serif" font-size="44" font-weight="800" fill="#f8fafc" text-anchor="middle" letter-spacing="4">SCRIPTCRAFT</text>
+</svg>

@@ -1,0 +1,6 @@
+{
+  "name": "ScriptCraft - Handwriting to TTF Font Studio",
+  "description": "Convert your natural handwriting into installable TrueType fonts (.ttf) for personal projects, inspired by r/Handwriting. Features real-time glyph drawing, printable grid scanning, AI penmanship analysis, and instant font downloads.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
