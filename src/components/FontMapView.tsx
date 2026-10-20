@@ -509,7 +509,9 @@ export const FontMapView: React.FC<FontMapViewProps> = ({
                         {v.strokes && v.strokes.length > 0 ? (
                           <svg viewBox="0 0 800 800" className="w-full h-full">
                             <path
-                              d={strokesToSvgPath(v.strokes)}
+                              d={strokesToSvgPath(
+                                v.rotation ? rotateGlyphStrokes(v.strokes, v.rotation) : v.strokes
+                              )}
                               fill="none"
                               stroke="#0f172a"
                               strokeWidth={penSettings.baseWidth}

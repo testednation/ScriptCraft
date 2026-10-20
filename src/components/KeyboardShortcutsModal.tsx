@@ -43,8 +43,10 @@ export const KeyboardShortcutsModal: React.FC<KeyboardShortcutsModalProps> = ({
         { keys: ['H'], description: 'Mirror / Flip character horizontally (Left ↔ Right)' },
         { keys: ['V'], description: 'Mirror / Flip character vertically (Top ↕ Bottom)' },
         { keys: ['[', ']'], description: 'Fine-tune character tilt / rotation angle (±1°)' },
+        { keys: ['C'], description: 'Center glyph strokes within metric boundaries' },
+        { keys: ['F'], description: 'Toggle Focus Mode (high contrast black text & canvas expansion)' },
         { keys: ['Backspace'], description: 'Delete most recent stroke (can be undone with Ctrl+Z)' },
-        { keys: ['Esc'], description: 'Close modals & panels' },
+        { keys: ['Esc'], description: 'Close modals, panels & exit Focus Mode' },
       ],
     },
     {

@@ -463,6 +463,8 @@ export default function App() {
               setCurrentChar(char);
               setActiveTab('studio');
             }}
+            onUpdateAllGlyphs={setGlyphs}
+            penSettings={penSettings}
           />
         )}
 

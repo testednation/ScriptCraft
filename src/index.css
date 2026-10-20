@@ -1,1 +1,24 @@
 @import "tailwindcss";
+
+/* Global High-Contrast Focus Mode Styling */
+input:focus,
+textarea:focus,
+select:focus {
+  color: #000000;
+}
+
+/* Contrast color preservation in dark mode / dark surface focus */
+.dark input:focus,
+.dark textarea:focus,
+[data-theme="dark"] input:focus,
+[data-theme="dark"] textarea:focus,
+.bg-slate-900 input:focus,
+.bg-slate-900 textarea:focus,
+.bg-slate-950 input:focus,
+.bg-slate-950 textarea:focus,
+.bg-\[\#0f172a\] input:focus,
+.bg-\[\#0f172a\] textarea:focus,
+.bg-\[\#14171a\] input:focus,
+.bg-\[\#14171a\] textarea:focus {
+  color: #ffffff;
+}

@@ -31,6 +31,10 @@ import {
   FlipHorizontal,
   FlipVertical,
   Ghost,
+  AlignCenter,
+  Crosshair,
+  Focus,
+  Minimize2,
 } from 'lucide-react';
 import { GlyphData, GlyphStroke, GlyphVariant, PenSettings, PenToolType } from '../types/font';
 import {
@@ -45,6 +49,9 @@ import {
   rotateGlyphStrokes,
   mirrorStrokesHorizontal,
   mirrorStrokesVertical,
+  centerGlyphStrokes,
+  getStrokesBoundingBox,
+  CenteringVerticalMode,
 } from '../utils/fontEngine';
 import { calculateGlyphBearing } from '../utils/autoSpacing';
 import { beautifyGlyphStrokes, batchBeautifyAllGlyphs } from '../utils/strokeSmoothing';
@@ -53,6 +60,7 @@ import { StrokeWidthInspector } from './StrokeWidthInspector';
 import { TracingGuideInspector } from './TracingGuideInspector';
 import { UnderlayInspector, UnderlayState } from './UnderlayInspector';
 import { GhostPathInspector, GhostPathSettings } from './GhostPathInspector';
+import { ContextualAlternatesModal } from './ContextualAlternatesModal';
 import {
   renderCanvasVariableStrokes,
   drawStrokeWidthVisualIndicator,
@@ -272,6 +280,9 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   // Alternate Glyph Variants state
   const [activeVariantId, setActiveVariantId] = useState<string>('primary');
   const [showPrimaryGhostInVariant, setShowPrimaryGhostInVariant] = useState<boolean>(true);
+  // Focus Mode state (distraction-free maximized drawing canvas with high contrast text)
+  const [isFocusMode, setIsFocusMode] = useState<boolean>(false);
+  const [isContextualModalOpen, setIsContextualModalOpen] = useState<boolean>(false);
 
   // Reset to primary variant when current character changes
   useEffect(() => {
@@ -354,22 +365,24 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setCharRotation(rot);
   }, [currentChar, activeVariantId, isEditingVariant, activeVariant?.rotation, currentGlyph?.rotation]);
 
-  // Compute character horizontal bounding box and baseline pivot point
+  // Toggle for showing live bounding box & metric alignment crosshair
+  const [showBoundingBox, setShowBoundingBox] = useState<boolean>(false);
+  const [centeringVerticalMode, setCenteringVerticalMode] =
+    useState<CenteringVerticalMode>('ascender-descender');
+
+  // Compute character bounding box across all points
+  const currentBBox = useMemo(() => {
+    return getStrokesBoundingBox(currentStrokes);
+  }, [currentStrokes]);
+
+  // Compute character horizontal bounding box center and baseline pivot point
   const { pivotX, pivotY } = useMemo(() => {
-    let minX = Infinity;
-    let maxX = -Infinity;
-    for (const stroke of currentStrokes) {
-      for (const pt of stroke) {
-        if (pt.x < minX) minX = pt.x;
-        if (pt.x > maxX) maxX = pt.x;
-      }
-    }
     const px =
-      minX !== Infinity
-        ? (minX + maxX) / 2
+      currentBBox !== null
+        ? currentBBox.centerX
         : CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36;
     return { pivotX: px, pivotY: CANVAS_BASELINE };
-  }, [currentStrokes, currentGlyph.advanceWidth]);
+  }, [currentBBox, currentGlyph.advanceWidth]);
 
   // Handler to adjust character-specific tilt independently of global slant
   const handleRotationChange = useCallback(
@@ -500,6 +513,50 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setTimeout(() => setBeautifyNotice(null), 2500);
   }, [currentStrokes, updateActiveStrokes, currentChar]);
 
+  // Center glyph strokes horizontally and vertically within the font's metric boundaries
+  const handleCenterGlyph = useCallback(
+    (mode?: CenteringVerticalMode) => {
+      if (currentStrokes.length === 0) return;
+      const vMode = mode || centeringVerticalMode;
+      const activeAdvance = isEditingVariant
+        ? (activeVariant?.advanceWidth ?? currentGlyph.advanceWidth ?? 600)
+        : (currentGlyph.advanceWidth ?? 600);
+
+      const result = centerGlyphStrokes(currentStrokes, {
+        advanceWidth: activeAdvance,
+        verticalMode: vMode,
+      });
+
+      if (!result.bbox) return;
+
+      if (result.deltaX === 0 && result.deltaY === 0) {
+        setBeautifyNotice(`'${currentChar}' is already centered within font metric boundaries`);
+        setTimeout(() => setBeautifyNotice(null), 2000);
+        return;
+      }
+
+      setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+      setRedoStack([]);
+      updateActiveStrokes(result.strokes);
+
+      const dxStr = result.deltaX > 0 ? `+${result.deltaX}` : `${result.deltaX}`;
+      const dyStr = result.deltaY > 0 ? `+${result.deltaY}` : `${result.deltaY}`;
+      setBeautifyNotice(
+        `Centered '${currentChar}' within metric boundaries (ΔX: ${dxStr}px, ΔY: ${dyStr}px)`
+      );
+      setTimeout(() => setBeautifyNotice(null), 2500);
+    },
+    [
+      currentStrokes,
+      centeringVerticalMode,
+      isEditingVariant,
+      activeVariant,
+      currentGlyph.advanceWidth,
+      updateActiveStrokes,
+      currentChar,
+    ]
+  );
+
   const handleAddVariant = () => {
     const nextNum = variantsList.length + 2;
     const newVariant: GlyphVariant = {
@@ -532,6 +589,31 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     if (activeVariantId === varId) {
       setActiveVariantId('primary');
     }
+  };
+
+  const handleApplyContextualVariants = (updates: Record<string, GlyphVariant[]>) => {
+    if (onUpdateAllGlyphs) {
+      const newGlyphs = { ...glyphs };
+      for (const [char, variants] of Object.entries(updates)) {
+        if (newGlyphs[char]) {
+          newGlyphs[char] = {
+            ...newGlyphs[char],
+            variants,
+          };
+        }
+      }
+      onUpdateAllGlyphs(newGlyphs);
+    } else {
+      for (const [char, variants] of Object.entries(updates)) {
+        const g = glyphs[char];
+        if (g) {
+          onUpdateGlyph(char, g.strokes, g.advanceWidth, variants, g.rotation);
+        }
+      }
+    }
+    const count = Object.keys(updates).length;
+    setBeautifyNotice(`Generated contextual alternates for ${count} character${count === 1 ? '' : 's'}!`);
+    setTimeout(() => setBeautifyNotice(null), 3000);
   };
 
   const [beautifyNotice, setBeautifyNotice] = useState<string | null>(null);
@@ -891,7 +973,98 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       );
     }
 
+    // Draw Bounding Box & Metric Centerlines Overlay
+    if (showBoundingBox && currentBBox) {
+      ctx.save();
+      const leftX = CANVAS_ORIGIN_X;
+      const rightX = leftX + (currentGlyph.advanceWidth || 600) * 0.72;
+      const metricCenterX = (leftX + rightX) / 2;
+      const metricCenterY = (CANVAS_ASCENDER + CANVAS_DESCENDER) / 2;
+
+      // 1. Metric boundaries center crosshair (indigo)
+      ctx.strokeStyle = 'rgba(99, 102, 241, 0.45)';
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 4]);
+
+      // Vertical metric center line
+      ctx.beginPath();
+      ctx.moveTo(metricCenterX, CANVAS_ASCENDER - 15);
+      ctx.lineTo(metricCenterX, CANVAS_DESCENDER + 15);
+      ctx.stroke();
+
+      // Horizontal metric center line
+      ctx.beginPath();
+      ctx.moveTo(leftX - 15, metricCenterY);
+      ctx.lineTo(rightX + 15, metricCenterY);
+      ctx.stroke();
+
+      // Target metric center intersection ring
+      ctx.strokeStyle = '#6366f1';
+      ctx.lineWidth = 1.8;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(metricCenterX, metricCenterY, 5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // 2. Stroke Bounding Box (emerald)
+      ctx.strokeStyle = 'rgba(16, 185, 129, 0.75)';
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([3, 3]);
+      ctx.strokeRect(
+        currentBBox.minX,
+        currentBBox.minY,
+        currentBBox.width,
+        currentBBox.height
+      );
+
+      // 3. Stroke center point (emerald dot)
+      ctx.fillStyle = '#10b981';
+      ctx.beginPath();
+      ctx.arc(currentBBox.centerX, currentBBox.centerY, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Distance line from stroke center to metric center if offset
+      const dist = Math.hypot(
+        currentBBox.centerX - metricCenterX,
+        currentBBox.centerY - metricCenterY
+      );
+      if (dist > 3) {
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath();
+        ctx.moveTo(currentBBox.centerX, currentBBox.centerY);
+        ctx.lineTo(metricCenterX, metricCenterY);
+        ctx.stroke();
+      }
+
+      // Small badge showing bbox dimensions
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      const dimText = `${Math.round(currentBBox.width)}×${Math.round(currentBBox.height)}px`;
+      ctx.font = 'bold 10px monospace';
+      const textMetrics = ctx.measureText(dimText);
+      const textW = textMetrics.width;
+      const badgeX = currentBBox.minX;
+      const badgeY = Math.max(18, currentBBox.minY - 6);
+      ctx.fillRect(badgeX - 2, badgeY - 11, textW + 8, 14);
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'left';
+      ctx.fillText(dimText, badgeX + 2, badgeY);
+
+      ctx.restore();
+    }
+
     if (charRotation !== 0) {
+      ctx.restore();
+    }
+
+    // In Focus Mode, draw a clean high-contrast black character indicator & watermark
+    if (isFocusMode) {
+      ctx.save();
+      ctx.fillStyle = '#000000';
+      ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(`Focus Mode · '${currentChar}' (High Contrast Black)`, CANVAS_SIZE - 40, 48);
       ctx.restore();
     }
 
@@ -929,6 +1102,9 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     charRotation,
     pivotX,
     pivotY,
+    showBoundingBox,
+    currentBBox,
+    isFocusMode,
   ]);
 
   // Load underlay image into underlayImgRef whenever underlay.src changes
@@ -1172,6 +1348,19 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         // Tilt character right (increase rotation)
         e.preventDefault();
         handleRotationChange(Math.min(30, charRotation + 1));
+      } else if (e.key === 'c' || e.key === 'C') {
+        // Center glyph strokes within metric boundaries
+        e.preventDefault();
+        handleCenterGlyph();
+      } else if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey) {
+        // Toggle Focus Mode in GlyphStudio
+        e.preventDefault();
+        setIsFocusMode((prev) => !prev);
+      } else if (e.key === 'Escape') {
+        if (isFocusMode) {
+          e.preventDefault();
+          setIsFocusMode(false);
+        }
       } else if (e.key === 'Backspace' || e.key === 'Delete') {
         // Delete last stroke with undo support
         if (currentStrokes.length > 0) {
@@ -1193,16 +1382,22 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     handleBeautifyCurrent,
     handleMirrorHorizontal,
     handleMirrorVertical,
+    handleCenterGlyph,
     allChars,
     onSelectChar,
     charRotation,
     handleRotationChange,
+    isFocusMode,
   ]);
 
   return (
     <div className="flex flex-col lg:flex-row h-[calc(100vh-61px)] bg-slate-50 overflow-hidden">
       {/* Left Column: Character Matrix Navigator */}
-      <aside className="w-full lg:w-72 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col shrink-0">
+      <aside
+        className={`w-full lg:w-72 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex-col shrink-0 transition-all ${
+          isFocusMode ? 'hidden' : 'flex'
+        }`}
+      >
         <div className="p-4 border-b border-slate-200">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-xs font-semibold text-slate-900 tracking-wider uppercase font-mono">
@@ -1282,7 +1477,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             <span className="text-[10px] text-slate-500 font-mono">← / →</span>
           </div>
           <p className="text-[11px] leading-relaxed text-slate-500">
-            Use <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">←</kbd> and <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">→</kbd> to cycle letters. <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">Ctrl+Z</kbd> to undo.
+            Use <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">←</kbd>/<kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">→</kbd> cycle letters. <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">C</kbd> center glyph. <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">Ctrl+Z</kbd> undo.
           </p>
         </div>
       </aside>
@@ -1314,6 +1509,13 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
+
+            {isFocusMode && (
+              <span className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold rounded-lg bg-black text-white shadow-xs">
+                <Focus className="w-3.5 h-3.5" />
+                <span>Focus Mode Active · Contrast Black</span>
+              </span>
+            )}
 
             <div className="hidden sm:block text-xs text-slate-500 font-mono">
               Unicode: U+{currentChar.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase()}
@@ -1522,6 +1724,17 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <span>Smooth & Beautify</span>
             </button>
 
+            {/* Center Glyph Button */}
+            <button
+              onClick={() => handleCenterGlyph()}
+              disabled={currentStrokes.length === 0}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-indigo-900 bg-indigo-50 border border-indigo-200 rounded-md hover:bg-indigo-100 hover:border-indigo-300 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-2xs active:scale-[0.98]"
+              title="Center Glyph: Calculate bounding box and shift strokes to be centered within metric boundaries [C]"
+            >
+              <AlignCenter className="w-3.5 h-3.5 text-indigo-600" />
+              <span>Center Glyph</span>
+            </button>
+
             {/* Mirror / Flip Tools */}
             <div className="flex items-center rounded-md border border-slate-200 overflow-hidden bg-white shadow-2xs">
               <button
@@ -1593,6 +1806,29 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             >
               <Trash2 className="w-3.5 h-3.5" />
               <span>Clear</span>
+            </button>
+
+            {/* Focus Mode Button */}
+            <button
+              onClick={() => setIsFocusMode((prev) => !prev)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md transition-all shadow-2xs active:scale-[0.98] ${
+                isFocusMode
+                  ? 'bg-black text-white hover:bg-slate-800'
+                  : 'text-slate-800 bg-white hover:bg-slate-100 border border-slate-300'
+              }`}
+              title="Toggle Focus Mode: Distraction-free drawing canvas with high-contrast black text [F]"
+            >
+              {isFocusMode ? (
+                <>
+                  <Minimize2 className="w-3.5 h-3.5 text-white" />
+                  <span>Exit Focus [Esc]</span>
+                </>
+              ) : (
+                <>
+                  <Focus className="w-3.5 h-3.5 text-slate-800" />
+                  <span>Focus Mode [F]</span>
+                </>
+              )}
             </button>
           </div>
         </div>
@@ -1705,6 +1941,16 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                 <span className="hidden sm:inline">Duplicate to Variant</span>
               </button>
             )}
+
+            {/* Automated Contextual Alternates Generator Button */}
+            <button
+              onClick={() => setIsContextualModalOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-indigo-700 bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200/90 rounded-md hover:from-indigo-100 hover:to-purple-100 transition-all shadow-2xs shrink-0"
+              title="Automate organic handwriting variations to prevent the robotic look of repeating identical characters in text"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+              <span>Auto-Alternates</span>
+            </button>
           </div>
 
           {/* Contextual Info & Ghost Toggle */}
@@ -1915,6 +2161,20 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                 Tracing Guide
               </span>
             </label>
+
+            {/* Bounding Box & Metric Centerlines Toggle */}
+            <label className="flex items-center gap-1.5 cursor-pointer select-none text-emerald-700 font-medium">
+              <input
+                type="checkbox"
+                checked={showBoundingBox}
+                onChange={(e) => setShowBoundingBox(e.target.checked)}
+                className="rounded border-emerald-300 text-emerald-600 focus:ring-0"
+              />
+              <span className="flex items-center gap-1">
+                <Crosshair className="w-3.5 h-3.5 text-emerald-500" />
+                Bounding Box & Center
+              </span>
+            </label>
           </div>
 
           <div className="flex items-center gap-4 flex-wrap">
@@ -1981,7 +2241,11 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       </main>
 
       {/* Right Column: Glyph Metrics & Live Preview */}
-      <aside className="w-full lg:w-80 bg-white border-t lg:border-t-0 lg:border-l border-slate-200 flex flex-col shrink-0 p-5 overflow-y-auto space-y-6">
+      <aside
+        className={`w-full lg:w-80 bg-white border-t lg:border-t-0 lg:border-l border-slate-200 flex-col shrink-0 p-5 overflow-y-auto space-y-6 transition-all ${
+          isFocusMode ? 'hidden' : 'flex'
+        }`}
+      >
         <div>
           <h3 className="text-xs font-semibold text-slate-900 tracking-wider uppercase font-mono mb-3">
             Character Preview
@@ -2044,6 +2308,29 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                 </button>
               )}
             </div>
+          </div>
+
+          {/* Automated Contextual Alternates Quick Launcher */}
+          <div className="mt-3 p-3 bg-gradient-to-br from-indigo-50/80 to-purple-50/60 border border-indigo-200/80 rounded-xl space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-indigo-950 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Contextual Alternates</span>
+              </span>
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 font-bold">
+                {variantsList.length} variant{variantsList.length === 1 ? '' : 's'}
+              </span>
+            </div>
+            <p className="text-[11px] text-indigo-900/80 leading-tight">
+              Auto-generate humanized variations to eliminate robotic repeating letters in long text.
+            </p>
+            <button
+              onClick={() => setIsContextualModalOpen(true)}
+              className="w-full flex items-center justify-center gap-1.5 py-1.5 px-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold transition-colors shadow-2xs"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Generate Alternates</span>
+            </button>
           </div>
         </div>
 
@@ -2146,6 +2433,62 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <FlipVertical className="w-3.5 h-3.5 text-indigo-600" />
               <span>Mirror Vertical</span>
             </button>
+          </div>
+
+          {/* Centering within Metric Boundaries */}
+          <div className="pt-2 border-t border-slate-200/80 space-y-2">
+            <div className="flex items-center justify-between text-[11px] text-slate-600">
+              <span className="font-semibold flex items-center gap-1.5 text-slate-800">
+                <AlignCenter className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Center within Metrics</span>
+              </span>
+              {currentBBox && (
+                <span
+                  className="font-mono text-[10px] text-slate-500 bg-white px-1.5 py-0.5 rounded border border-slate-200"
+                  title="Current stroke bounding box dimensions (Width × Height)"
+                >
+                  {Math.round(currentBBox.width)}×{Math.round(currentBBox.height)}px
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                onClick={() => handleCenterGlyph('ascender-descender')}
+                disabled={currentStrokes.length === 0}
+                className="flex items-center justify-center gap-1.5 py-1.5 px-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 disabled:opacity-40 rounded-lg text-xs font-semibold transition-colors"
+                title="Shift strokes to center horizontally & vertically between Ascender and Descender [C]"
+              >
+                <AlignCenter className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Center Full [C]</span>
+              </button>
+              <button
+                onClick={() => handleCenterGlyph('ascender-baseline')}
+                disabled={currentStrokes.length === 0}
+                className="flex items-center justify-center gap-1.5 py-1.5 px-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 disabled:opacity-40 rounded-lg text-xs font-medium transition-colors"
+                title="Shift strokes to center horizontally and vertically between Ascender and Baseline"
+              >
+                <Crosshair className="w-3.5 h-3.5 text-slate-500" />
+                <span>Body Center</span>
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between text-[10px] text-slate-500 pt-0.5">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none hover:text-slate-800">
+                <input
+                  type="checkbox"
+                  checked={showBoundingBox}
+                  onChange={(e) => setShowBoundingBox(e.target.checked)}
+                  className="rounded border-slate-300 text-indigo-600 focus:ring-0 w-3 h-3"
+                />
+                <span>Overlay BBox & Guides</span>
+              </label>
+              {currentBBox && (
+                <span className="font-mono text-slate-400">
+                  Ctr: ({Math.round(currentBBox.centerX)}, {Math.round(currentBBox.centerY)})
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -2258,6 +2601,19 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
           setRedoStack([]);
           updateActiveStrokes(strokes);
         }}
+      />
+
+      {/* Contextual Alternates Generator Modal */}
+      <ContextualAlternatesModal
+        isOpen={isContextualModalOpen}
+        onClose={() => setIsContextualModalOpen(false)}
+        currentChar={currentChar}
+        glyphs={glyphs}
+        onApplyVariants={handleApplyContextualVariants}
+        baseWidth={penSettings.baseWidth}
+        tool={penSettings.tool}
+        pressureSensitivity={penSettings.pressureSensitivity}
+        fontFamilyName="MyHandwriting"
       />
     </div>
   );

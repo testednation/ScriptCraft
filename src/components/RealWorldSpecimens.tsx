@@ -358,7 +358,7 @@ export const RealWorldSpecimens: React.FC<RealWorldSpecimensProps> = ({
                   onChange={(e) => setBcData({ ...bcData, slogan: e.target.value })}
                   style={fontStyle}
                   rows={2}
-                  className="w-full bg-transparent border-none outline-none text-2xl sm:text-3xl font-normal leading-snug resize-none"
+                  className="w-full bg-transparent border-none outline-none text-2xl sm:text-3xl font-normal leading-snug resize-none focus:text-slate-950 focus:opacity-100 transition-colors"
                   placeholder="Handwritten slogan or personal motto"
                 />
               </div>
@@ -368,14 +368,14 @@ export const RealWorldSpecimens: React.FC<RealWorldSpecimensProps> = ({
                   type="text"
                   value={bcData.email}
                   onChange={(e) => setBcData({ ...bcData, email: e.target.value })}
-                  className="bg-transparent border-none outline-none truncate"
+                  className="bg-transparent border-none outline-none truncate focus:text-slate-950 focus:opacity-100 transition-colors"
                   placeholder="email"
                 />
                 <input
                   type="text"
                   value={bcData.website}
                   onChange={(e) => setBcData({ ...bcData, website: e.target.value })}
-                  className="bg-transparent border-none outline-none text-right truncate"
+                  className="bg-transparent border-none outline-none text-right truncate focus:text-slate-950 focus:opacity-100 transition-colors"
                   placeholder="website"
                 />
               </div>

@@ -143,6 +143,134 @@ export function mirrorStrokesVertical(
 }
 
 /**
+ * Calculates bounding box of glyph strokes
+ */
+export function getStrokesBoundingBox(strokes: GlyphStroke[]): {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  width: number;
+  height: number;
+  centerX: number;
+  centerY: number;
+} | null {
+  if (!strokes || strokes.length === 0) return null;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+
+  for (const stroke of strokes) {
+    for (const pt of stroke) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+  }
+
+  if (minX === Infinity) return null;
+  return {
+    minX,
+    maxX,
+    minY,
+    maxY,
+    width: Math.max(0, maxX - minX),
+    height: Math.max(0, maxY - minY),
+    centerX: (minX + maxX) / 2,
+    centerY: (minY + maxY) / 2,
+  };
+}
+
+export type CenteringVerticalMode = 'ascender-descender' | 'ascender-baseline' | 'cap-baseline';
+
+/**
+ * Automatically calculates the bounding box of glyph strokes and shifts
+ * them so that they are horizontally and vertically centered within the
+ * font's metric boundaries.
+ */
+export function centerGlyphStrokes(
+  strokes: GlyphStroke[],
+  options?: {
+    advanceWidth?: number;
+    verticalMode?: CenteringVerticalMode;
+    customTargetCenterX?: number;
+    customTargetCenterY?: number;
+  }
+): {
+  strokes: GlyphStroke[];
+  deltaX: number;
+  deltaY: number;
+  bbox: {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    width: number;
+    height: number;
+    centerX: number;
+    centerY: number;
+  } | null;
+} {
+  const bbox = getStrokesBoundingBox(strokes);
+  if (!bbox || strokes.length === 0) {
+    return { strokes, deltaX: 0, deltaY: 0, bbox: null };
+  }
+
+  // Horizontal metric bounds:
+  // Left side bearing is CANVAS_ORIGIN_X (120)
+  // Right boundary is CANVAS_ORIGIN_X + advanceWidth * 0.72
+  const leftX = CANVAS_ORIGIN_X;
+  const advance = options?.advanceWidth ?? 600;
+  const rightX = leftX + advance * 0.72;
+  const targetCenterX =
+    options?.customTargetCenterX !== undefined
+      ? options.customTargetCenterX
+      : (leftX + rightX) / 2;
+
+  // Vertical metric bounds:
+  // Standard typographic em-box boundary is between Ascender (160) and Descender (760)
+  let topY = CANVAS_ASCENDER;
+  let bottomY = CANVAS_DESCENDER;
+
+  if (options?.verticalMode === 'ascender-baseline') {
+    topY = CANVAS_ASCENDER;
+    bottomY = CANVAS_BASELINE;
+  } else if (options?.verticalMode === 'cap-baseline') {
+    topY = CANVAS_CAP_HEIGHT;
+    bottomY = CANVAS_BASELINE;
+  }
+
+  const targetCenterY =
+    options?.customTargetCenterY !== undefined
+      ? options.customTargetCenterY
+      : (topY + bottomY) / 2;
+
+  const deltaX = Math.round(targetCenterX - bbox.centerX);
+  const deltaY = Math.round(targetCenterY - bbox.centerY);
+
+  if (deltaX === 0 && deltaY === 0) {
+    return { strokes, deltaX: 0, deltaY: 0, bbox };
+  }
+
+  const centeredStrokes = strokes.map((stroke) =>
+    stroke.map((pt) => ({
+      ...pt,
+      x: Math.round((pt.x + deltaX) * 100) / 100,
+      y: Math.round((pt.y + deltaY) * 100) / 100,
+    }))
+  );
+
+  return {
+    strokes: centeredStrokes,
+    deltaX,
+    deltaY,
+    bbox,
+  };
+}
+
+/**
  * Expands an array of open polyline strokes with variable thickness into
  * closed 2D polygon outlines suitable for TrueType font contours.
  */
@@ -151,7 +279,8 @@ export function strokesToOpenTypePath(
   baseWidth = 14,
   tool: 'fountain' | 'drafting' | 'rollerball' | 'calligraphy' = 'rollerball',
   unitsPerEm = 1000,
-  pressureSensitivity = true
+  pressureSensitivity = true,
+  nibAngle = 45
 ): opentype.Path {
   const path = new opentype.Path();
   const scale = (unitsPerEm * 0.8) / (CANVAS_BASELINE - CANVAS_ASCENDER);
@@ -219,10 +348,9 @@ export function strokesToOpenTypePath(
       let ny = dx / len;
 
       if (tool === 'calligraphy') {
-        // 45 degree chisel angle modulation
-        const angle = Math.PI / 4;
-        const dot = Math.abs(Math.cos(angle) * (dx / len) + Math.sin(angle) * (dy / len));
-        const calligThickness = fontBaseWidth * (0.3 + 1.2 * (1 - dot));
+        const rad = (nibAngle * Math.PI) / 180;
+        const dot = Math.abs(Math.cos(rad) * (dx / len) + Math.sin(rad) * (dy / len));
+        const calligThickness = fontBaseWidth * (0.25 + 1.25 * (1 - dot));
         leftSide.push({
           x: Math.round(curr.x + nx * (calligThickness / 2)),
           y: Math.round(curr.y + ny * (calligThickness / 2)),
@@ -296,7 +424,8 @@ export function buildOpenTypeFont(
   baseWidth = 14,
   kerningMap: KerningMap = {},
   ligaturesMap: Record<string, LigatureData> = {},
-  pressureSensitivity = true
+  pressureSensitivity = true,
+  nibAngle = 45
 ): opentype.Font {
   const notdefPath = new opentype.Path();
   // Standard square .notdef glyph
@@ -331,6 +460,7 @@ export function buildOpenTypeFont(
 
   const fontGlyphs = [notdefGlyph, spaceGlyph];
   const charToIndex: Record<string, number> = { ' ': 1 };
+  const alternateRegistrations: { charIndex: number; altIndices: number[] }[] = [];
 
   for (const [char, glyphData] of Object.entries(glyphsMap)) {
     if (!glyphData || glyphData.strokes.length === 0) continue;
@@ -345,7 +475,8 @@ export function buildOpenTypeFont(
       baseWidth,
       tool,
       metadata.unitsPerEm,
-      pressureSensitivity
+      pressureSensitivity,
+      nibAngle
     );
 
     // Compute character advance width
@@ -372,6 +503,7 @@ export function buildOpenTypeFont(
 
     // Register alternate glyph variants if provided
     if (glyphData.variants && glyphData.variants.length > 0) {
+      const altIndices: number[] = [];
       glyphData.variants.forEach((variant, vIdx) => {
         if (!variant.strokes || variant.strokes.length === 0) return;
         const varRotation = variant.rotation ?? charRotation;
@@ -384,7 +516,8 @@ export function buildOpenTypeFont(
           baseWidth,
           tool,
           metadata.unitsPerEm,
-          pressureSensitivity
+          pressureSensitivity,
+          nibAngle
         );
         const varAdvance = variant.advanceWidth || advance;
         const varGlyph = new opentype.Glyph({
@@ -394,7 +527,15 @@ export function buildOpenTypeFont(
           path: varPath,
         });
         fontGlyphs.push(varGlyph);
+        altIndices.push(fontGlyphs.length - 1);
       });
+
+      if (altIndices.length > 0) {
+        alternateRegistrations.push({
+          charIndex: charToIndex[char],
+          altIndices,
+        });
+      }
     }
   }
 
@@ -408,7 +549,8 @@ export function buildOpenTypeFont(
       baseWidth,
       tool,
       metadata.unitsPerEm,
-      pressureSensitivity
+      pressureSensitivity,
+      nibAngle
     );
 
     const ligGlyph = new opentype.Glyph({
@@ -459,6 +601,24 @@ export function buildOpenTypeFont(
         });
       } catch (err) {
         console.warn('Could not register GSUB ligature for:', sequence, err);
+      }
+    }
+  }
+
+  // Register OpenType GSUB Alternate substitutions ('calt' Contextual Alternates and 'salt' Stylistic Alternates)
+  for (const { charIndex, altIndices } of alternateRegistrations) {
+    if (charIndex !== undefined && altIndices.length > 0) {
+      try {
+        (font.substitution as any).addAlternate('calt', {
+          sub: charIndex,
+          by: altIndices,
+        });
+        (font.substitution as any).addAlternate('salt', {
+          sub: charIndex,
+          by: altIndices,
+        });
+      } catch (err) {
+        console.warn('Could not register GSUB contextual alternate:', err);
       }
     }
   }

@@ -25,6 +25,21 @@ export interface GlyphStrokeMetrics {
 }
 
 /**
+ * Calibrates raw stylus / pointer pressure according to response curve and gamma.
+ */
+export function applyPressureCalibration(
+  rawPressure: number = 1,
+  curve: 'soft' | 'linear' | 'firm' | 'custom' = 'linear',
+  gamma: number = 1.0
+): number {
+  const p = Math.max(0.04, Math.min(1.0, rawPressure));
+  if (curve === 'soft') return Math.pow(p, 0.55); // sensitive, easy thick lines
+  if (curve === 'firm') return Math.pow(p, 1.65); // requires firm press for broad lines
+  if (curve === 'custom' && gamma && gamma > 0) return Math.pow(p, gamma);
+  return p;
+}
+
+/**
  * Computes the exact pixel width at a stroke point based on penSettings and tangent direction.
  */
 export function computeStrokePointWidth(
@@ -33,32 +48,36 @@ export function computeStrokePointWidth(
   tool: PenToolType = 'rollerball',
   pressureSensitivity: boolean = true,
   dx: number = 0,
-  dy: number = 1
+  dy: number = 1,
+  nibAngle: number = 45,
+  pressureCurve: 'soft' | 'linear' | 'firm' | 'custom' = 'linear',
+  pressureGamma: number = 1.0
 ): number {
   if (!pressureSensitivity || tool === 'drafting') {
     return Math.max(1, baseWidth);
   }
 
   const rawPressure = typeof pressure === 'number' && pressure > 0 ? pressure : 1;
+  const calibratedPressure = applyPressureCalibration(rawPressure, pressureCurve, pressureGamma);
 
   if (tool === 'fountain') {
     // Dynamic flex nib: high contrast between light hairlines and heavy swells
-    const flex = Math.min(1.85, Math.max(0.42, rawPressure * 1.25));
+    const flex = Math.min(1.9, Math.max(0.4, calibratedPressure * 1.3));
     return Math.max(2, Math.round(baseWidth * flex * 10) / 10);
   }
 
   if (tool === 'calligraphy') {
-    // 45-degree chisel nib angle modulation
+    // Chisel nib angle modulation based on customizable nibAngle in degrees
     const len = Math.hypot(dx, dy) || 1;
-    const angle = Math.PI / 4;
-    const dot = Math.abs(Math.cos(angle) * (dx / len) + Math.sin(angle) * (dy / len));
-    const chiselMod = 0.35 + 1.15 * (1 - dot);
-    const pressMod = Math.min(1.4, Math.max(0.7, rawPressure));
+    const rad = (nibAngle * Math.PI) / 180;
+    const dot = Math.abs(Math.cos(rad) * (dx / len) + Math.sin(rad) * (dy / len));
+    const chiselMod = 0.25 + 1.25 * (1 - dot);
+    const pressMod = Math.min(1.4, Math.max(0.7, calibratedPressure));
     return Math.max(2, Math.round(baseWidth * chiselMod * pressMod * 10) / 10);
   }
 
   // Rollerball / gel pen: smooth natural pressure curve
-  const smooth = Math.min(1.6, Math.max(0.48, rawPressure));
+  const smooth = Math.min(1.6, Math.max(0.48, calibratedPressure));
   return Math.max(2, Math.round(baseWidth * smooth * 10) / 10);
 }
 
@@ -231,7 +250,10 @@ export function generateStrokeContour(
   stroke: GlyphStroke,
   baseWidth: number,
   tool: PenToolType = 'rollerball',
-  pressureSensitivity: boolean = true
+  pressureSensitivity: boolean = true,
+  nibAngle: number = 45,
+  pressureCurve: 'soft' | 'linear' | 'firm' | 'custom' = 'linear',
+  pressureGamma: number = 1.0
 ): { left: Array<{ x: number; y: number; width: number }>; right: Array<{ x: number; y: number; width: number }> } {
   const left: Array<{ x: number; y: number; width: number }> = [];
   const right: Array<{ x: number; y: number; width: number }> = [];
@@ -261,7 +283,17 @@ export function generateStrokeContour(
     const nx = -dy / len;
     const ny = dx / len;
 
-    const width = computeStrokePointWidth(baseWidth, curr.pressure ?? 1, tool, pressureSensitivity, dx, dy);
+    const width = computeStrokePointWidth(
+      baseWidth,
+      curr.pressure ?? 1,
+      tool,
+      pressureSensitivity,
+      dx,
+      dy,
+      nibAngle,
+      pressureCurve,
+      pressureGamma
+    );
     const halfW = width / 2;
 
     left.push({
@@ -286,7 +318,10 @@ export function strokesToContourSvgPath(
   strokes: GlyphStroke[],
   baseWidth: number,
   tool: PenToolType = 'rollerball',
-  pressureSensitivity: boolean = true
+  pressureSensitivity: boolean = true,
+  nibAngle: number = 45,
+  pressureCurve: 'soft' | 'linear' | 'firm' | 'custom' = 'linear',
+  pressureGamma: number = 1.0
 ): string {
   let svg = '';
 
@@ -294,7 +329,17 @@ export function strokesToContourSvgPath(
     if (!stroke || stroke.length === 0) continue;
 
     if (stroke.length === 1) {
-      const w = computeStrokePointWidth(baseWidth, stroke[0].pressure ?? 1, tool, pressureSensitivity);
+      const w = computeStrokePointWidth(
+        baseWidth,
+        stroke[0].pressure ?? 1,
+        tool,
+        pressureSensitivity,
+        0,
+        1,
+        nibAngle,
+        pressureCurve,
+        pressureGamma
+      );
       const r = w / 2;
       svg += `M ${stroke[0].x - r} ${stroke[0].y} ` +
         `a ${r} ${r} 0 1 0 ${r * 2} 0 ` +
@@ -302,7 +347,15 @@ export function strokesToContourSvgPath(
       continue;
     }
 
-    const { left, right } = generateStrokeContour(stroke, baseWidth, tool, pressureSensitivity);
+    const { left, right } = generateStrokeContour(
+      stroke,
+      baseWidth,
+      tool,
+      pressureSensitivity,
+      nibAngle,
+      pressureCurve,
+      pressureGamma
+    );
     if (left.length === 0) continue;
 
     let d = `M ${left[0].x} ${left[0].y} `;
@@ -328,13 +381,26 @@ export function renderCanvasVariableStrokes(
   baseWidth: number,
   tool: PenToolType = 'rollerball',
   pressureSensitivity: boolean = true,
-  strokeColor: string = '#1e293b'
+  strokeColor: string = '#1e293b',
+  nibAngle: number = 45,
+  pressureCurve: 'soft' | 'linear' | 'firm' | 'custom' = 'linear',
+  pressureGamma: number = 1.0
 ) {
   for (const stroke of strokes) {
     if (!stroke || stroke.length === 0) continue;
 
     if (stroke.length === 1) {
-      const w = computeStrokePointWidth(baseWidth, stroke[0].pressure ?? 1, tool, pressureSensitivity);
+      const w = computeStrokePointWidth(
+        baseWidth,
+        stroke[0].pressure ?? 1,
+        tool,
+        pressureSensitivity,
+        0,
+        1,
+        nibAngle,
+        pressureCurve,
+        pressureGamma
+      );
       ctx.fillStyle = strokeColor;
       ctx.beginPath();
       ctx.arc(stroke[0].x, stroke[0].y, w / 2, 0, Math.PI * 2);
@@ -353,8 +419,28 @@ export function renderCanvasVariableStrokes(
       const dx = p1.x - p0.x;
       const dy = p1.y - p0.y;
 
-      const w0 = computeStrokePointWidth(baseWidth, p0.pressure ?? 1, tool, pressureSensitivity, dx, dy);
-      const w1 = computeStrokePointWidth(baseWidth, p1.pressure ?? 1, tool, pressureSensitivity, dx, dy);
+      const w0 = computeStrokePointWidth(
+        baseWidth,
+        p0.pressure ?? 1,
+        tool,
+        pressureSensitivity,
+        dx,
+        dy,
+        nibAngle,
+        pressureCurve,
+        pressureGamma
+      );
+      const w1 = computeStrokePointWidth(
+        baseWidth,
+        p1.pressure ?? 1,
+        tool,
+        pressureSensitivity,
+        dx,
+        dy,
+        nibAngle,
+        pressureCurve,
+        pressureGamma
+      );
       const avgW = (w0 + w1) / 2;
 
       ctx.beginPath();

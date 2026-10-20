@@ -47,8 +47,10 @@ export interface PenSettings {
   tool: PenToolType;
   baseWidth: number;
   smoothing: number; // 0 to 1
-  angle?: number; // Calligraphy nib angle
+  angle?: number; // Calligraphy nib angle in degrees (e.g. 45°, 30°, 52°)
   pressureSensitivity: boolean;
+  pressureCurve?: 'soft' | 'linear' | 'firm' | 'custom';
+  pressureGamma?: number; // 0.4 (soft) to 2.2 (firm)
 }
 
 export interface HandwritingPreset {
