@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import {
   Undo,
+  Redo,
   Trash2,
   Plus,
   Sparkles,
@@ -56,6 +57,16 @@ export const LigaturesEditor: React.FC<LigaturesEditorProps> = ({
     'First flight over the stiff stone forest with flowing feathers.'
   );
   const [enableGsubPreview, setEnableGsubPreview] = useState<boolean>(true);
+
+  // Undo and Redo stacks for ligature strokes
+  const [undoStack, setUndoStack] = useState<GlyphStroke[][]>([]);
+  const [redoStack, setRedoStack] = useState<GlyphStroke[][]>([]);
+
+  // Clear local stacks when switching ligatures
+  useEffect(() => {
+    setUndoStack([]);
+    setRedoStack([]);
+  }, [activeLigatureId]);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -254,6 +265,8 @@ export const LigaturesEditor: React.FC<LigaturesEditorProps> = ({
     e.currentTarget.setPointerCapture(e.pointerId);
     setIsDrawing(true);
     const pt = getCanvasPoint(e);
+    setUndoStack((prev) => [...prev.slice(-49), currentStrokes]);
+    setRedoStack([]);
     const updated = {
       ...activeLigature,
       strokes: [...currentStrokes, [pt]],
@@ -289,21 +302,73 @@ export const LigaturesEditor: React.FC<LigaturesEditorProps> = ({
     }
   };
 
-  const handleUndo = () => {
-    if (currentStrokes.length > 0) {
+  const handleUndo = useCallback(() => {
+    if (undoStack.length > 0) {
+      const prev = undoStack[undoStack.length - 1];
+      setUndoStack((u) => u.slice(0, -1));
+      setRedoStack((r) => [...r.slice(-49), currentStrokes]);
+      onUpdateLigature(activeLigatureId, {
+        ...activeLigature,
+        strokes: prev,
+      });
+    } else if (currentStrokes.length > 0) {
+      setRedoStack((r) => [...r.slice(-49), currentStrokes]);
       onUpdateLigature(activeLigatureId, {
         ...activeLigature,
         strokes: currentStrokes.slice(0, -1),
       });
     }
-  };
+  }, [undoStack, currentStrokes, activeLigature, activeLigatureId, onUpdateLigature]);
+
+  const handleRedo = useCallback(() => {
+    if (redoStack.length > 0) {
+      const next = redoStack[redoStack.length - 1];
+      setRedoStack((r) => r.slice(0, -1));
+      setUndoStack((u) => [...u.slice(-49), currentStrokes]);
+      onUpdateLigature(activeLigatureId, {
+        ...activeLigature,
+        strokes: next,
+      });
+    }
+  }, [redoStack, currentStrokes, activeLigature, activeLigatureId, onUpdateLigature]);
 
   const handleClear = () => {
-    onUpdateLigature(activeLigatureId, {
-      ...activeLigature,
-      strokes: [],
-    });
+    if (currentStrokes.length > 0) {
+      setUndoStack((u) => [...u.slice(-49), currentStrokes]);
+      setRedoStack([]);
+      onUpdateLigature(activeLigatureId, {
+        ...activeLigature,
+        strokes: [],
+      });
+    }
   };
+
+  // Keyboard shortcuts for Ligatures Editor
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (
+        document.activeElement?.tagName === 'INPUT' ||
+        document.activeElement?.tagName === 'TEXTAREA' ||
+        (document.activeElement as HTMLElement)?.isContentEditable
+      ) {
+        return;
+      }
+
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      } else if (
+        ((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')) ||
+        ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z') && e.shiftKey)
+      ) {
+        e.preventDefault();
+        handleRedo();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleUndo, handleRedo]);
 
   const handleAddNewLigature = (e: React.FormEvent) => {
     e.preventDefault();
@@ -489,21 +554,40 @@ export const LigaturesEditor: React.FC<LigaturesEditorProps> = ({
             ))}
           </div>
 
-          {/* Actions: Undo, Clear */}
+          {/* Actions: Undo, Redo, Clear */}
           <div className="flex items-center gap-1.5">
             <button
               onClick={handleUndo}
-              disabled={currentStrokes.length === 0}
-              className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 disabled:opacity-40 transition-colors"
-              title="Undo last stroke"
+              disabled={undoStack.length === 0 && currentStrokes.length === 0}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 disabled:opacity-40 transition-colors shadow-2xs"
+              title={`Undo last ligature stroke [Ctrl+Z]${undoStack.length > 0 ? ` (${undoStack.length} in history)` : ''}`}
             >
               <Undo className="w-3.5 h-3.5" />
               <span>Undo</span>
+              {undoStack.length > 0 && (
+                <span className="text-[10px] font-mono font-semibold px-1 rounded bg-slate-100 text-slate-600 tabular-nums">
+                  {undoStack.length}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={handleRedo}
+              disabled={redoStack.length === 0}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 disabled:opacity-40 transition-colors shadow-2xs"
+              title={`Redo reverted stroke [Ctrl+Y / Ctrl+Shift+Z]${redoStack.length > 0 ? ` (${redoStack.length} available)` : ''}`}
+            >
+              <Redo className="w-3.5 h-3.5" />
+              <span>Redo</span>
+              {redoStack.length > 0 && (
+                <span className="text-[10px] font-mono font-semibold px-1 rounded bg-slate-100 text-slate-600 tabular-nums">
+                  {redoStack.length}
+                </span>
+              )}
             </button>
             <button
               onClick={handleClear}
               disabled={currentStrokes.length === 0}
-              className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-rose-600 bg-white border border-rose-200 rounded-md hover:bg-rose-50 disabled:opacity-40 transition-colors"
+              className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-rose-600 bg-white border border-rose-200 rounded-md hover:bg-rose-50 disabled:opacity-40 transition-colors shadow-2xs"
               title="Clear ligature canvas"
             >
               <Trash2 className="w-3.5 h-3.5" />

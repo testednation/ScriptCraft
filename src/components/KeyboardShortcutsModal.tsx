@@ -33,8 +33,12 @@ export const KeyboardShortcutsModal: React.FC<KeyboardShortcutsModalProps> = ({
     {
       category: 'Glyph Studio Canvas Actions',
       items: [
-        { keys: [`${modKey}`, 'Z'], description: 'Undo last stroke' },
-        { keys: [`${modKey}`, 'Y'], description: 'Redo stroke (or Shift+Cmd+Z)' },
+        { keys: [`${modKey}`, 'Z'], description: 'Multi-step Undo (strokes, kerning, presets)' },
+        { keys: [`${modKey}`, 'Y'], description: 'Multi-step Redo (or Shift+Cmd+Z)' },
+        { keys: ['P'], description: 'Switch to Pen Drawing Mode' },
+        { keys: ['E'], description: 'Switch to Selective Segment Eraser Mode' },
+        { keys: ['M'], description: 'Toggle Pressure Intensity Heatmap visualization layer' },
+        { keys: ['[', ']'], description: 'Resize Eraser brush / tilt character angle' },
         { keys: ['←', '→'], description: 'Previous / Next character' },
         { keys: ['U'], description: 'Toggle Underlay reference image on / off' },
         { keys: ['T'], description: 'Toggle Tracing Guide overlay on / off' },
@@ -42,7 +46,6 @@ export const KeyboardShortcutsModal: React.FC<KeyboardShortcutsModalProps> = ({
         { keys: ['B'], description: 'Beautify & smooth active glyph strokes' },
         { keys: ['H'], description: 'Mirror / Flip character horizontally (Left ↔ Right)' },
         { keys: ['V'], description: 'Mirror / Flip character vertically (Top ↕ Bottom)' },
-        { keys: ['[', ']'], description: 'Fine-tune character tilt / rotation angle (±1°)' },
         { keys: ['C'], description: 'Center glyph strokes within metric boundaries' },
         { keys: ['F'], description: 'Toggle Focus Mode (high contrast black text & canvas expansion)' },
         { keys: ['Backspace'], description: 'Delete most recent stroke (can be undone with Ctrl+Z)' },

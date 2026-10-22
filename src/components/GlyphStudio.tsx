@@ -35,6 +35,8 @@ import {
   Crosshair,
   Focus,
   Minimize2,
+  Eraser,
+  Flame,
 } from 'lucide-react';
 import { GlyphData, GlyphStroke, GlyphVariant, PenSettings, PenToolType } from '../types/font';
 import {
@@ -55,6 +57,12 @@ import {
 } from '../utils/fontEngine';
 import { calculateGlyphBearing } from '../utils/autoSpacing';
 import { beautifyGlyphStrokes, batchBeautifyAllGlyphs } from '../utils/strokeSmoothing';
+import {
+  eraseStrokeSegments,
+  eraseStrokeSegmentsAlongPath,
+  eraseWholeStrokesAtPoint,
+} from '../utils/strokeEraser';
+import { renderPressureHeatmapLayer, computeStrokesPressureStats } from '../utils/pressureHeatmap';
 import { SingleCharCropModal } from './SingleCharCropModal';
 import { StrokeWidthInspector } from './StrokeWidthInspector';
 import { TracingGuideInspector } from './TracingGuideInspector';
@@ -90,6 +98,11 @@ interface GlyphStudioProps {
   setSlant: (slant: number) => void;
   onOpenAiTips?: (char: string) => void;
   onOpenScanTab?: () => void;
+  onRecordHistory?: (actionDesc?: string) => void;
+  onGlobalUndo?: () => void;
+  onGlobalRedo?: () => void;
+  canGlobalUndo?: boolean;
+  canGlobalRedo?: boolean;
 }
 
 const CHARACTER_GROUPS = [
@@ -125,6 +138,11 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   setSlant,
   onOpenAiTips,
   onOpenScanTab,
+  onRecordHistory,
+  onGlobalUndo,
+  onGlobalRedo,
+  canGlobalUndo,
+  canGlobalRedo,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const studioFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -164,6 +182,17 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   const [isCropModalOpen, setIsCropModalOpen] = useState(false);
   const [pastedImageSrc, setPastedImageSrc] = useState<string | null>(null);
   const [isDragOverCanvas, setIsDragOverCanvas] = useState(false);
+
+  // Tool mode: Precision Pen vs Selective Segment Eraser
+  const [drawingMode, setDrawingMode] = useState<'pen' | 'eraser'>('pen');
+  const [eraserSubMode, setEraserSubMode] = useState<'segment' | 'whole'>('segment');
+  const [eraserRadius, setEraserRadius] = useState<number>(24);
+  const [eraserCursor, setEraserCursor] = useState<{ x: number; y: number; visible: boolean } | null>(null);
+  const prevEraserPosRef = useRef<{ x: number; y: number } | null>(null);
+  const hasPushedUndoForCurrentEraserDrag = useRef<boolean>(false);
+
+  // Pressure Intensity Heatmap visualization layer
+  const [showPressureHeatmap, setShowPressureHeatmap] = useState<boolean>(false);
 
   // Underlay file upload handler
   const handleUnderlayFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -373,6 +402,11 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   // Compute character bounding box across all points
   const currentBBox = useMemo(() => {
     return getStrokesBoundingBox(currentStrokes);
+  }, [currentStrokes]);
+
+  // Compute live stroke pressure statistics for the heatmap visualization layer
+  const pressureStats = useMemo(() => {
+    return computeStrokesPressureStats(currentStrokes);
   }, [currentStrokes]);
 
   // Compute character horizontal bounding box center and baseline pivot point
@@ -973,6 +1007,38 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       );
     }
 
+    // Pressure Intensity Heatmap visualization layer
+    if (showPressureHeatmap && currentStrokes.length > 0) {
+      renderPressureHeatmapLayer(ctx, currentStrokes, penSettings.baseWidth, {
+        showNumericBadges: true,
+        showGlow: true,
+      });
+    }
+
+    // Selective Segment or Whole Stroke Eraser Circular Reticle
+    if (drawingMode === 'eraser' && eraserCursor && eraserCursor.visible) {
+      ctx.save();
+      const isSegment = eraserSubMode === 'segment';
+      const strokeColor = isSegment ? '#f43f5e' : '#f97316';
+      const fillColor = isSegment ? 'rgba(244, 63, 94, 0.12)' : 'rgba(249, 115, 22, 0.15)';
+
+      ctx.strokeStyle = strokeColor;
+      ctx.fillStyle = fillColor;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(eraserCursor.x, eraserCursor.y, eraserRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Center crosshair dot
+      ctx.fillStyle = strokeColor;
+      ctx.beginPath();
+      ctx.arc(eraserCursor.x, eraserCursor.y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
     // Draw Bounding Box & Metric Centerlines Overlay
     if (showBoundingBox && currentBBox) {
       ctx.save();
@@ -1083,6 +1149,11 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     showWidthOverlay,
     showWidthCalipers,
     showMinMaxBadges,
+    showPressureHeatmap,
+    drawingMode,
+    eraserSubMode,
+    eraserRadius,
+    eraserCursor,
     tracingGuide,
     underlay.src,
     underlay.visible,
@@ -1163,7 +1234,40 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     e.currentTarget.setPointerCapture(e.pointerId);
     setIsDrawing(true);
     const pt = getCanvasPoint(e);
-    // Entry taper
+
+    const isStylusEraser = (e.buttons & 32) !== 0 || e.button === 5;
+    const effectiveEraser = drawingMode === 'eraser' || isStylusEraser;
+
+    // Eraser mode: selectively slice and remove stroke segments or whole strokes inside circular brush
+    if (effectiveEraser) {
+      prevEraserPosRef.current = { x: pt.x, y: pt.y };
+      hasPushedUndoForCurrentEraserDrag.current = false;
+      setEraserCursor({ x: pt.x, y: pt.y, visible: true });
+
+      if (currentStrokes.length > 0) {
+        const result =
+          eraserSubMode === 'segment'
+            ? eraseStrokeSegments(currentStrokes, pt.x, pt.y, eraserRadius)
+            : eraseWholeStrokesAtPoint(currentStrokes, pt.x, pt.y, eraserRadius);
+
+        if (result.changed) {
+          setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+          setRedoStack([]);
+          hasPushedUndoForCurrentEraserDrag.current = true;
+          if (onRecordHistory) {
+            onRecordHistory(
+              eraserSubMode === 'segment'
+                ? `Erase segments in '${currentChar}'`
+                : `Delete stroke in '${currentChar}'`
+            );
+          }
+          updateActiveStrokes(result.strokes);
+        }
+      }
+      return;
+    }
+
+    // Pen mode: Entry taper
     if (penSettings.pressureSensitivity && e.pointerType !== 'pen') {
       pt.pressure = 0.65;
     }
@@ -1175,8 +1279,56 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isDrawing) return;
     const pt = getCanvasPoint(e);
+    const isStylusEraser = (e.buttons & 32) !== 0 || e.button === 5;
+    const effectiveEraser = drawingMode === 'eraser' || isStylusEraser;
+
+    // Eraser mode: update cursor reticle and continuously erase intersected stroke segments along drag path
+    if (effectiveEraser) {
+      setEraserCursor({ x: pt.x, y: pt.y, visible: true });
+
+      if (isDrawing && currentStrokes.length > 0) {
+        let result: { strokes: GlyphStroke[]; changed: boolean };
+
+        if (eraserSubMode === 'segment') {
+          if (prevEraserPosRef.current) {
+            result = eraseStrokeSegmentsAlongPath(
+              currentStrokes,
+              prevEraserPosRef.current.x,
+              prevEraserPosRef.current.y,
+              pt.x,
+              pt.y,
+              eraserRadius
+            );
+          } else {
+            result = eraseStrokeSegments(currentStrokes, pt.x, pt.y, eraserRadius);
+          }
+        } else {
+          result = eraseWholeStrokesAtPoint(currentStrokes, pt.x, pt.y, eraserRadius);
+        }
+
+        if (result.changed) {
+          if (!hasPushedUndoForCurrentEraserDrag.current) {
+            setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+            setRedoStack([]);
+            hasPushedUndoForCurrentEraserDrag.current = true;
+            if (onRecordHistory) {
+              onRecordHistory(
+                eraserSubMode === 'segment'
+                  ? `Erase segments in '${currentChar}'`
+                  : `Delete stroke in '${currentChar}'`
+              );
+            }
+          }
+          updateActiveStrokes(result.strokes);
+        }
+      }
+
+      prevEraserPosRef.current = { x: pt.x, y: pt.y };
+      return;
+    }
+
+    if (!isDrawing) return;
     const strokes = [...currentStrokes];
     if (strokes.length === 0) return;
 
@@ -1209,11 +1361,18 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!isDrawing) return;
     setIsDrawing(false);
+    prevEraserPosRef.current = null;
+    hasPushedUndoForCurrentEraserDrag.current = false;
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
       // Ignore if pointer capture release throws
     }
+  };
+
+  const handlePointerLeave = () => {
+    setEraserCursor(null);
+    prevEraserPosRef.current = null;
   };
 
   // Delete the most recent stroke with full undo tracking
@@ -1251,8 +1410,10 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       updateActiveStrokes(cloneGlyphStrokes(currentStrokes.slice(0, -1)));
       setBeautifyNotice(`Undo: removed stroke (${currentStrokes.length - 1} remaining)`);
       setTimeout(() => setBeautifyNotice(null), 1800);
+    } else if (onGlobalUndo && canGlobalUndo) {
+      onGlobalUndo();
     }
-  }, [undoStack, currentStrokes, updateActiveStrokes]);
+  }, [undoStack, currentStrokes, updateActiveStrokes, onGlobalUndo, canGlobalUndo]);
 
   const handleRedo = useCallback(() => {
     setIsDrawing(false);
@@ -1264,8 +1425,10 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       updateActiveStrokes(cloneGlyphStrokes(nextStrokes));
       setBeautifyNotice(`Redo: restored stroke (${newRedo.length} remaining)`);
       setTimeout(() => setBeautifyNotice(null), 1800);
+    } else if (onGlobalRedo && canGlobalRedo) {
+      onGlobalRedo();
     }
-  }, [redoStack, currentStrokes, updateActiveStrokes]);
+  }, [redoStack, currentStrokes, updateActiveStrokes, onGlobalRedo, canGlobalRedo]);
 
   const goToPrev = () => {
     if (currentIndex > 0) {
@@ -1308,6 +1471,28 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         return;
       }
 
+      // Tool switches: E for Eraser, P for Pen
+      if ((e.key === 'e' || e.key === 'E') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setDrawingMode('eraser');
+        setBeautifyNotice(`Eraser Tool active (Size: ${eraserRadius}px)`);
+        setTimeout(() => setBeautifyNotice(null), 1500);
+        return;
+      }
+      if ((e.key === 'p' || e.key === 'P') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setDrawingMode('pen');
+        setBeautifyNotice('Pen Drawing Tool active');
+        setTimeout(() => setBeautifyNotice(null), 1500);
+        return;
+      }
+      // M: Toggle Pressure Heatmap
+      if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setShowPressureHeatmap((prev) => !prev);
+        return;
+      }
+
       if (e.key === 'ArrowLeft') {
         goToPrev();
       } else if (e.key === 'ArrowRight') {
@@ -1341,13 +1526,21 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         e.preventDefault();
         handleMirrorVertical();
       } else if (e.key === '[' || e.key === '{') {
-        // Tilt character left (decrease rotation)
         e.preventDefault();
-        handleRotationChange(Math.max(-30, charRotation - 1));
+        if (drawingMode === 'eraser') {
+          setEraserRadius((r) => Math.max(8, r - 4));
+        } else {
+          // Tilt character left (decrease rotation)
+          handleRotationChange(Math.max(-30, charRotation - 1));
+        }
       } else if (e.key === ']' || e.key === '}') {
-        // Tilt character right (increase rotation)
         e.preventDefault();
-        handleRotationChange(Math.min(30, charRotation + 1));
+        if (drawingMode === 'eraser') {
+          setEraserRadius((r) => Math.min(60, r + 4));
+        } else {
+          // Tilt character right (increase rotation)
+          handleRotationChange(Math.min(30, charRotation + 1));
+        }
       } else if (e.key === 'c' || e.key === 'C') {
         // Center glyph strokes within metric boundaries
         e.preventDefault();
@@ -1376,6 +1569,10 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     currentIndex,
     handleUndo,
     handleRedo,
+    drawingMode,
+    eraserRadius,
+    charRotation,
+    handleRotationChange,
     handleDeleteLastStroke,
     currentStrokes.length,
     underlay.src,
@@ -1385,8 +1582,6 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     handleCenterGlyph,
     allChars,
     onSelectChar,
-    charRotation,
-    handleRotationChange,
     isFocusMode,
   ]);
 
@@ -1522,31 +1717,131 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             </div>
           </div>
 
-          {/* Pen Tool Segmented Control */}
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-            {(
-              [
-                { id: 'fountain', label: 'Fountain Pen' },
-                { id: 'rollerball', label: 'Gel Pen' },
-                { id: 'drafting', label: 'Drafting 0.5' },
-                { id: 'calligraphy', label: 'Broad Nib' },
-              ] as const
-            ).map((tool) => (
-              <button
-                key={tool.id}
-                onClick={() => setPenSettings((prev) => ({ ...prev, tool: tool.id }))}
-                className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap ${
-                  penSettings.tool === tool.id
-                    ? 'bg-white text-slate-900 shadow-sm font-semibold'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                {tool.label}
-              </button>
-            ))}
+          {/* Mode Selector: Precision Pen vs Selective Segment Eraser */}
+          <div className="flex items-center p-1 bg-slate-200/80 rounded-lg gap-1 shrink-0">
+            <button
+              onClick={() => setDrawingMode('pen')}
+              className={`flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded transition-all ${
+                drawingMode === 'pen'
+                  ? 'bg-white text-slate-900 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+              title="Pen Drawing Mode [P]: Draw calligraphic vector strokes"
+            >
+              <Zap className="w-3.5 h-3.5 text-indigo-600" />
+              <span>Draw [P]</span>
+            </button>
+            <button
+              onClick={() => setDrawingMode('eraser')}
+              className={`flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded transition-all ${
+                drawingMode === 'eraser'
+                  ? 'bg-rose-500 text-white shadow-sm font-bold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+              title="Selective Segment Eraser Mode [E]: Slices and removes only stroke segments inside the brush circle"
+            >
+              <Eraser className="w-3.5 h-3.5" />
+              <span>Eraser [E]</span>
+            </button>
           </div>
 
-          {/* Pressure Sensitivity & Width Indicators Quick Controls */}
+          {/* Eraser Controls Bar (visible when Eraser mode is active) */}
+          {drawingMode === 'eraser' && (
+            <div className="flex items-center gap-2.5 bg-rose-50/90 border border-rose-200 px-3 py-1 rounded-lg text-xs shrink-0 animate-in fade-in duration-150 flex-wrap">
+              {/* Eraser Type Sub-Mode: Segment vs Whole Stroke */}
+              <div className="flex items-center p-0.5 bg-white/90 rounded-md gap-0.5 border border-rose-200/90 shadow-2xs">
+                <button
+                  onClick={() => setEraserSubMode('segment')}
+                  className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-all ${
+                    eraserSubMode === 'segment'
+                      ? 'bg-rose-600 text-white shadow-2xs'
+                      : 'text-rose-700 hover:bg-rose-100/70'
+                  }`}
+                  title="Selective Segment Eraser: Slices strokes and excises only points inside the brush circle"
+                >
+                  Segment Cut
+                </button>
+                <button
+                  onClick={() => setEraserSubMode('whole')}
+                  className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-all ${
+                    eraserSubMode === 'whole'
+                      ? 'bg-amber-600 text-white shadow-2xs'
+                      : 'text-rose-700 hover:bg-rose-100/70'
+                  }`}
+                  title="Whole Stroke Eraser: Removes the entire connected stroke on contact"
+                >
+                  Whole Stroke
+                </button>
+              </div>
+
+              {/* Quick Size Presets */}
+              <div className="flex items-center gap-1">
+                {[
+                  { label: 'Fine', size: 12 },
+                  { label: 'Med', size: 24 },
+                  { label: 'Broad', size: 40 },
+                ].map((preset) => (
+                  <button
+                    key={preset.size}
+                    onClick={() => setEraserRadius(preset.size)}
+                    className={`px-1.5 py-0.5 text-[10px] font-mono font-semibold rounded border transition-colors ${
+                      eraserRadius === preset.size
+                        ? 'bg-rose-600 text-white border-rose-600 shadow-2xs'
+                        : 'bg-white text-rose-800 border-rose-200 hover:bg-rose-100'
+                    }`}
+                    title={`Set eraser diameter to ${preset.size}px`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Eraser Radius Slider */}
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="range"
+                  min="8"
+                  max="60"
+                  step="2"
+                  value={eraserRadius}
+                  onChange={(e) => setEraserRadius(Number(e.target.value))}
+                  className="w-16 accent-rose-600"
+                  title="Adjust eraser circular brush diameter [ or ]"
+                />
+                <span className="font-mono text-rose-700 font-bold w-7 text-right tabular-nums text-[11px]">
+                  {eraserRadius}px
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Pen Tool Segmented Control (visible when Pen mode is active) */}
+          {drawingMode === 'pen' && (
+            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg shrink-0">
+              {(
+                [
+                  { id: 'fountain', label: 'Fountain Pen' },
+                  { id: 'rollerball', label: 'Gel Pen' },
+                  { id: 'drafting', label: 'Drafting 0.5' },
+                  { id: 'calligraphy', label: 'Broad Nib' },
+                ] as const
+              ).map((tool) => (
+                <button
+                  key={tool.id}
+                  onClick={() => setPenSettings((prev) => ({ ...prev, tool: tool.id }))}
+                  className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap ${
+                    penSettings.tool === tool.id
+                      ? 'bg-white text-slate-900 shadow-sm font-semibold'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {tool.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Pressure Sensitivity, Heatmap & Width Indicators Quick Controls */}
           <div className="flex items-center gap-2">
             <button
               onClick={() =>
@@ -1568,6 +1863,20 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             >
               <Activity className="w-3.5 h-3.5 text-indigo-600" />
               <span>Pressure {penSettings.pressureSensitivity ? 'ON' : 'OFF'}</span>
+            </button>
+
+            {/* Pressure Intensity Heatmap Toggle Button */}
+            <button
+              onClick={() => setShowPressureHeatmap((prev) => !prev)}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                showPressureHeatmap
+                  ? 'bg-gradient-to-r from-cyan-500/10 via-amber-500/15 to-rose-500/20 border border-amber-300 text-amber-950 shadow-2xs ring-1 ring-amber-300/60'
+                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+              }`}
+              title="Toggle Pressure Intensity Heatmap: Visualizes stylus/downstroke input intensity with chromatic heat gradients [M]"
+            >
+              <Flame className={`w-3.5 h-3.5 ${showPressureHeatmap ? 'text-amber-600 animate-pulse' : 'text-slate-400'}`} />
+              <span>Heatmap {showPressureHeatmap ? 'ON' : 'OFF'}</span>
             </button>
 
             <button
@@ -1994,9 +2303,77 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               onPointerDown={handlePointerDown}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}
-              className="w-full h-full cursor-crosshair block"
+              onPointerLeave={handlePointerLeave}
+              className={`w-full h-full block ${
+                drawingMode === 'eraser' ? 'cursor-none' : 'cursor-crosshair'
+              }`}
               style={{ touchAction: 'none' }}
             />
+
+            {/* Floating Pressure Intensity Heatmap HUD Card */}
+            {showPressureHeatmap && (
+              <div className="absolute top-2.5 left-2.5 z-20 bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-xl p-3 text-white shadow-xl max-w-[270px] animate-in fade-in slide-in-from-top-1 duration-200 select-none">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-amber-300">
+                    <Flame className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Pressure Intensity</span>
+                  </div>
+                  <button
+                    onClick={() => setShowPressureHeatmap(false)}
+                    className="text-slate-400 hover:text-white text-xs font-bold px-1"
+                    title="Close Heatmap Layer"
+                  >
+                    ×
+                  </button>
+                </div>
+
+                {/* Chromatic spectrum gradient bar */}
+                <div className="h-2 rounded-full w-full bg-gradient-to-r from-[#06b6d4] via-[#10b981] via-[#f59e0b] to-[#ef4444] shadow-inner mb-1.5" />
+                <div className="flex items-center justify-between text-[9px] text-slate-300 font-mono mb-2">
+                  <span className="text-cyan-300">&lt;0.35 Light</span>
+                  <span className="text-emerald-300">0.50 Steady</span>
+                  <span className="text-amber-300">0.90 Firm</span>
+                  <span className="text-rose-300">&gt;1.05 Swell</span>
+                </div>
+
+                {/* Live Stroke Pressure Metrics */}
+                <div className="grid grid-cols-4 gap-1.5 pt-2 border-t border-slate-800 text-center font-mono">
+                  <div className="bg-slate-800/80 rounded px-1 py-1">
+                    <div className="text-[9px] text-slate-400 uppercase">Min</div>
+                    <div className="text-[11px] font-bold text-cyan-300">{pressureStats.min}</div>
+                  </div>
+                  <div className="bg-slate-800/80 rounded px-1 py-1">
+                    <div className="text-[9px] text-slate-400 uppercase">Avg</div>
+                    <div className="text-[11px] font-bold text-emerald-300">{pressureStats.avg}</div>
+                  </div>
+                  <div className="bg-slate-800/80 rounded px-1 py-1">
+                    <div className="text-[9px] text-slate-400 uppercase">Max</div>
+                    <div className="text-[11px] font-bold text-rose-300">{pressureStats.max}</div>
+                  </div>
+                  <div className="bg-slate-800/80 rounded px-1 py-1">
+                    <div className="text-[9px] text-slate-400 uppercase">Pts</div>
+                    <div className="text-[11px] font-bold text-amber-300">{pressureStats.pointCount}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Floating Eraser Mode Status on Canvas */}
+            {drawingMode === 'eraser' && (
+              <div
+                className={`absolute bottom-2.5 right-2.5 z-20 flex items-center gap-1.5 backdrop-blur-xs text-white border rounded-lg py-1 px-2.5 text-[11px] shadow-lg select-none ${
+                  eraserSubMode === 'segment'
+                    ? 'bg-rose-900/90 border-rose-500/50'
+                    : 'bg-amber-900/90 border-amber-500/50'
+                }`}
+              >
+                <Eraser className="w-3.5 h-3.5 text-rose-300 animate-pulse" />
+                <span className="font-semibold text-rose-100">
+                  {eraserSubMode === 'segment' ? 'Segment Cut' : 'Whole Stroke'}: {eraserRadius}px
+                </span>
+                <span className="text-rose-300/80 text-[10px]">([ / ] to resize)</span>
+              </div>
+            )}
 
             {/* Beautify Notice Toast */}
             {beautifyNotice && (
@@ -2173,6 +2550,20 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <span className="flex items-center gap-1">
                 <Crosshair className="w-3.5 h-3.5 text-emerald-500" />
                 Bounding Box & Center
+              </span>
+            </label>
+
+            {/* Pressure Intensity Heatmap Toggle */}
+            <label className="flex items-center gap-1.5 cursor-pointer select-none text-amber-800 font-medium">
+              <input
+                type="checkbox"
+                checked={showPressureHeatmap}
+                onChange={(e) => setShowPressureHeatmap(e.target.checked)}
+                className="rounded border-amber-300 text-amber-600 focus:ring-0"
+              />
+              <span className="flex items-center gap-1">
+                <Flame className="w-3.5 h-3.5 text-amber-500" />
+                Pressure Heatmap
               </span>
             </label>
           </div>

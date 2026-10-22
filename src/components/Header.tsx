@@ -1,5 +1,23 @@
 import React from 'react';
-import { PenTool, Download, Sparkles, BookOpen, Grid, Layers, Eye, Sliders, Link2, LayoutGrid, Camera, Laptop, HardDriveDownload, Printer, Keyboard } from 'lucide-react';
+import {
+  PenTool,
+  Download,
+  Sparkles,
+  BookOpen,
+  Grid,
+  Layers,
+  Eye,
+  Sliders,
+  Link2,
+  LayoutGrid,
+  Camera,
+  Laptop,
+  HardDriveDownload,
+  Printer,
+  Keyboard,
+  Undo,
+  Redo,
+} from 'lucide-react';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface HeaderProps {
@@ -11,6 +29,12 @@ interface HeaderProps {
   onQuickDownload: () => void;
   onOpenOfflineExport: () => void;
   onOpenShortcuts?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  undoCount?: number;
+  redoCount?: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -22,6 +46,12 @@ export const Header: React.FC<HeaderProps> = ({
   onQuickDownload,
   onOpenOfflineExport,
   onOpenShortcuts,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
+  undoCount,
+  redoCount,
 }) => {
   return (
     <header className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 md:gap-4 px-4 md:px-6 py-2.5 md:py-3.5 border-b border-slate-200 bg-white/95 backdrop-blur-sm sticky top-0 z-40">
@@ -49,6 +79,27 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Mobile Action Buttons (Visible on small screens) */}
         <div className="flex md:hidden items-center gap-1.5">
+          {(onUndo || onRedo) && (
+            <div className="flex items-center rounded-lg border border-slate-200 bg-white p-0.5">
+              <button
+                onClick={onUndo}
+                disabled={!canUndo}
+                className="p-1.5 text-slate-700 hover:bg-slate-100 disabled:opacity-35 rounded"
+                title="Undo"
+              >
+                <Undo className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={onRedo}
+                disabled={!canRedo}
+                className="p-1.5 text-slate-700 hover:bg-slate-100 disabled:opacity-35 rounded"
+                title="Redo"
+              >
+                <Redo className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           <button
             onClick={onOpenOfflineExport}
             className="flex items-center gap-1 px-2 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 border border-slate-300 rounded-lg hover:bg-slate-200 transition-all shadow-2xs whitespace-nowrap"
@@ -205,6 +256,41 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Zone 3: Primary Actions (Desktop) */}
       <div className="hidden md:flex items-center gap-2.5 shrink-0">
+        {/* Project Multi-Step Undo / Redo */}
+        {(onUndo || onRedo) && (
+          <div className="flex items-center rounded-lg border border-slate-200 bg-white p-0.5 shadow-2xs">
+            <button
+              onClick={onUndo}
+              disabled={!canUndo}
+              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-900 disabled:opacity-35 disabled:cursor-not-allowed rounded transition-colors"
+              title={`Project Undo: Revert multi-step font and kerning edits [Ctrl+Z]${undoCount ? ` (${undoCount} in stack)` : ''}`}
+            >
+              <Undo className="w-3.5 h-3.5 text-slate-600" />
+              <span className="hidden lg:inline">Undo</span>
+              {undoCount !== undefined && undoCount > 0 && (
+                <span className="text-[10px] font-mono px-1 rounded bg-slate-100 text-slate-700 font-semibold">
+                  {undoCount}
+                </span>
+              )}
+            </button>
+            <div className="w-[1px] h-3.5 bg-slate-200" />
+            <button
+              onClick={onRedo}
+              disabled={!canRedo}
+              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-900 disabled:opacity-35 disabled:cursor-not-allowed rounded transition-colors"
+              title={`Project Redo: Restore reverted font and kerning edits [Ctrl+Y / Ctrl+Shift+Z]${redoCount ? ` (${redoCount} available)` : ''}`}
+            >
+              <Redo className="w-3.5 h-3.5 text-slate-600" />
+              <span className="hidden lg:inline">Redo</span>
+              {redoCount !== undefined && redoCount > 0 && (
+                <span className="text-[10px] font-mono px-1 rounded bg-slate-100 text-slate-700 font-semibold">
+                  {redoCount}
+                </span>
+              )}
+            </button>
+          </div>
+        )}
+
         {/* In-app PWA install button */}
         <PWAInstallButton />
 

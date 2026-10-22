@@ -19,6 +19,12 @@ import { buildOpenTypeFont, registerLiveFontFace } from './utils/fontEngine';
 import { DEFAULT_INITIAL_KERNING } from './utils/kerningDefaults';
 import { generateStarterLigatures } from './utils/ligatureDefaults';
 import { autoCalculateAllBearings, SpacingPreset } from './utils/autoSpacing';
+import {
+  createProjectSnapshot,
+  cloneGlyphsMap,
+  cloneKerningMap,
+  ProjectHistorySnapshot,
+} from './utils/historyManager';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'studio' | 'fontmap' | 'ligatures' | 'kerning' | 'presets' | 'scan' | 'ai' | 'specimen' | 'worksheets' | 'export'>('studio');
@@ -30,6 +36,11 @@ export default function App() {
   const [isShortcutsOpen, setIsShortcutsOpen] = useState<boolean>(false);
   const [kerningMap, setKerningMap] = useState<KerningMap>(DEFAULT_INITIAL_KERNING);
   const [ligatures, setLigatures] = useState<Record<string, LigatureData>>(() => generateStarterLigatures());
+
+  // Multi-step History State Manager tracking 'glyphs' and 'kerningMap'
+  const [projectUndoStack, setProjectUndoStack] = useState<ProjectHistorySnapshot[]>([]);
+  const [projectRedoStack, setProjectRedoStack] = useState<ProjectHistorySnapshot[]>([]);
+  const [historyToast, setHistoryToast] = useState<string | null>(null);
 
   // Pen settings
   const [penSettings, setPenSettings] = useState<PenSettings>({
@@ -109,6 +120,46 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [recompileLiveFont]);
 
+  // Record an immutable project history snapshot before mutations
+  const recordHistorySnapshot = useCallback(
+    (actionDesc?: string) => {
+      const snapshot = createProjectSnapshot(glyphs, kerningMap, actionDesc);
+      setProjectUndoStack((prev) => [...prev.slice(-49), snapshot]);
+      setProjectRedoStack([]);
+    },
+    [glyphs, kerningMap]
+  );
+
+  // Revert to previous project state (multi-step undo)
+  const handleGlobalUndo = useCallback(() => {
+    if (projectUndoStack.length === 0) return;
+    const previousSnapshot = projectUndoStack[projectUndoStack.length - 1];
+    const currentSnapshot = createProjectSnapshot(glyphs, kerningMap, 'Current state');
+
+    setProjectUndoStack((prev) => prev.slice(0, -1));
+    setProjectRedoStack((prev) => [...prev.slice(-49), currentSnapshot]);
+    setGlyphs(cloneGlyphsMap(previousSnapshot.glyphs));
+    setKerningMap(cloneKerningMap(previousSnapshot.kerningMap));
+
+    setHistoryToast(`Undo: Reverted ${previousSnapshot.action || 'previous change'}`);
+    setTimeout(() => setHistoryToast(null), 3000);
+  }, [projectUndoStack, glyphs, kerningMap]);
+
+  // Advance to next project state (multi-step redo)
+  const handleGlobalRedo = useCallback(() => {
+    if (projectRedoStack.length === 0) return;
+    const nextSnapshot = projectRedoStack[projectRedoStack.length - 1];
+    const currentSnapshot = createProjectSnapshot(glyphs, kerningMap, 'Current state');
+
+    setProjectRedoStack((prev) => prev.slice(0, -1));
+    setProjectUndoStack((prev) => [...prev.slice(-49), currentSnapshot]);
+    setGlyphs(cloneGlyphsMap(nextSnapshot.glyphs));
+    setKerningMap(cloneKerningMap(nextSnapshot.kerningMap));
+
+    setHistoryToast(`Redo: Restored ${nextSnapshot.action || 'change'}`);
+    setTimeout(() => setHistoryToast(null), 3000);
+  }, [projectRedoStack, glyphs, kerningMap]);
+
   // Update a single glyph's strokes or metrics
   const handleUpdateGlyph = (
     char: string,
@@ -142,6 +193,7 @@ export default function App() {
   };
 
   const handleUpdateVariants = (char: string, variants: GlyphVariant[]) => {
+    recordHistorySnapshot(`Update Alternates for '${char}'`);
     setGlyphs((prev) => {
       const existing = prev[char] || {
         char,
@@ -165,6 +217,7 @@ export default function App() {
 
   // Load an entire preset into the workspace
   const handleLoadPreset = (preset: HandwritingPreset) => {
+    recordHistorySnapshot(`Load Preset: ${preset.name}`);
     const newGlyphs: Record<string, GlyphData> = {};
     for (const [char, strokes] of Object.entries(preset.glyphs)) {
       newGlyphs[char] = {
@@ -220,6 +273,7 @@ export default function App() {
 
   // Apply batch scanned glyphs
   const handleApplyScannedGlyphs = (scanned: Record<string, GlyphStroke[]>) => {
+    recordHistorySnapshot('Apply Scanned Handwriting');
     setGlyphs((prev) => {
       const updated = { ...prev };
       for (const [char, strokes] of Object.entries(scanned)) {
@@ -257,6 +311,7 @@ export default function App() {
     kerningMap?: KerningMap;
     ligaturesMap?: Record<string, LigatureData>;
   }) => {
+    recordHistorySnapshot('Import Project Backup');
     if (data.metadata) setMetadata(data.metadata);
     if (data.glyphs) setGlyphs(data.glyphs);
     if (data.penSettings) setPenSettings(data.penSettings);
@@ -276,6 +331,28 @@ export default function App() {
           activeEl.isContentEditable)
       ) {
         return;
+      }
+
+      // Project History Undo: Ctrl+Z / Cmd+Z (without Shift)
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+        // If in studio, local glyph undo takes precedence if available; otherwise global undo kicks in
+        if (activeTab !== 'studio') {
+          e.preventDefault();
+          handleGlobalUndo();
+          return;
+        }
+      }
+
+      // Project History Redo: Ctrl+Y / Cmd+Y OR Ctrl+Shift+Z / Cmd+Shift+Z
+      if (
+        ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) ||
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'z' || e.key === 'Z'))
+      ) {
+        if (activeTab !== 'studio') {
+          e.preventDefault();
+          handleGlobalRedo();
+          return;
+        }
       }
 
       // Close open modals on Escape
@@ -331,13 +408,13 @@ export default function App() {
 
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [isShortcutsOpen, isExportOpen, isOfflineExportOpen]);
+  }, [isShortcutsOpen, isExportOpen, isOfflineExportOpen, activeTab, handleGlobalUndo, handleGlobalRedo]);
 
   const completedCount = Object.values(glyphs).filter((g) => g.strokes.length > 0).length;
   const totalCount = 64; // Standard character set target
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col font-['Plus_Jakarta_Sans',sans-serif] text-slate-900 selection:bg-amber-200 selection:text-slate-900">
+    <div className="min-h-screen bg-slate-50 flex flex-col font-['Plus_Jakarta_Sans',sans-serif] text-slate-900 selection:bg-amber-200 selection:text-slate-900 relative">
       {/* Top Header */}
       <Header
         activeTab={activeTab}
@@ -348,7 +425,21 @@ export default function App() {
         onQuickDownload={() => setIsExportOpen(true)}
         onOpenOfflineExport={() => setIsOfflineExportOpen(true)}
         onOpenShortcuts={() => setIsShortcutsOpen(true)}
+        canUndo={projectUndoStack.length > 0}
+        canRedo={projectRedoStack.length > 0}
+        onUndo={handleGlobalUndo}
+        onRedo={handleGlobalRedo}
+        undoCount={projectUndoStack.length}
+        redoCount={projectRedoStack.length}
       />
+
+      {/* Floating Project History Toast Notification */}
+      {historyToast && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-slate-900/95 text-white border border-slate-700 px-4 py-2 rounded-full text-xs font-semibold shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-top-2 duration-200 pointer-events-none">
+          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+          <span>{historyToast}</span>
+        </div>
+      )}
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col">
@@ -358,7 +449,10 @@ export default function App() {
             onSelectChar={setCurrentChar}
             glyphs={glyphs}
             onUpdateGlyph={handleUpdateGlyph}
-            onUpdateAllGlyphs={setGlyphs}
+            onUpdateAllGlyphs={(updated) => {
+              recordHistorySnapshot('Batch glyphs update');
+              setGlyphs(updated);
+            }}
             penSettings={penSettings}
             setPenSettings={setPenSettings}
             slant={slant}
@@ -368,6 +462,11 @@ export default function App() {
               setActiveTab('ai');
             }}
             onOpenScanTab={() => setActiveTab('scan')}
+            onRecordHistory={recordHistorySnapshot}
+            onGlobalUndo={handleGlobalUndo}
+            onGlobalRedo={handleGlobalRedo}
+            canGlobalUndo={projectUndoStack.length > 0}
+            canGlobalRedo={projectRedoStack.length > 0}
           />
         )}
 
@@ -380,6 +479,7 @@ export default function App() {
               setActiveTab('studio');
             }}
             onAutoSpaceAll={(preset) => {
+              recordHistorySnapshot('Auto-Space Bearings');
               const updated = autoCalculateAllBearings(
                 glyphs,
                 penSettings.baseWidth,
@@ -422,12 +522,14 @@ export default function App() {
           <KerningEditor
             glyphs={glyphs}
             kerningMap={kerningMap}
-            onUpdateKerning={(pair, value) =>
-              setKerningMap((prev) => ({ ...prev, [pair]: value }))
-            }
-            onBatchUpdateKerning={(pairs) =>
-              setKerningMap((prev) => ({ ...prev, ...pairs }))
-            }
+            onUpdateKerning={(pair, value) => {
+              recordHistorySnapshot(`Kerning: ${pair}`);
+              setKerningMap((prev) => ({ ...prev, [pair]: value }));
+            }}
+            onBatchUpdateKerning={(pairs) => {
+              recordHistorySnapshot('Batch Kerning Update');
+              setKerningMap((prev) => ({ ...prev, ...pairs }));
+            }}
             penSettings={penSettings}
             liveFontFamily={liveFontFamily}
           />
