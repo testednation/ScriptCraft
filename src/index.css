@@ -22,3 +22,9 @@ select:focus {
 .bg-\[\#14171a\] textarea:focus {
   color: #ffffff;
 }
+
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .safe-area-pb {
+    padding-bottom: calc(0.375rem + env(safe-area-inset-bottom));
+  }
+}

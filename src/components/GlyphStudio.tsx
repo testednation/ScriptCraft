@@ -37,6 +37,10 @@ import {
   Minimize2,
   Eraser,
   Flame,
+  Feather,
+  ClipboardCheck,
+  PenTool,
+  LayoutGrid,
 } from 'lucide-react';
 import { GlyphData, GlyphStroke, GlyphVariant, PenSettings, PenToolType } from '../types/font';
 import {
@@ -56,19 +60,35 @@ import {
   CenteringVerticalMode,
 } from '../utils/fontEngine';
 import { calculateGlyphBearing } from '../utils/autoSpacing';
-import { beautifyGlyphStrokes, batchBeautifyAllGlyphs } from '../utils/strokeSmoothing';
+import {
+  beautifyGlyphStrokes,
+  batchBeautifyAllGlyphs,
+  stabilizePointRealtime,
+  finalizeStrokeWithSmoothing,
+  snapGlyphToBaseline,
+} from '../utils/strokeSmoothing';
 import {
   eraseStrokeSegments,
   eraseStrokeSegmentsAlongPath,
   eraseWholeStrokesAtPoint,
 } from '../utils/strokeEraser';
-import { renderPressureHeatmapLayer, computeStrokesPressureStats } from '../utils/pressureHeatmap';
+import {
+  renderPressureHeatmapLayer,
+  computeStrokesPressureStats,
+  computePenmanshipConsistency,
+  balanceStrokesPressure,
+  boostStrokesPressureContrast,
+  PressureColorPalette,
+  PenmanshipMetrics,
+} from '../utils/pressureHeatmap';
 import { SingleCharCropModal } from './SingleCharCropModal';
 import { StrokeWidthInspector } from './StrokeWidthInspector';
 import { TracingGuideInspector } from './TracingGuideInspector';
-import { UnderlayInspector, UnderlayState } from './UnderlayInspector';
+import { UnderlayInspector, UnderlayState, ComplexSampleType } from './UnderlayInspector';
 import { GhostPathInspector, GhostPathSettings } from './GhostPathInspector';
+import { BaselineGuideInspector, GuideConfig } from './BaselineGuideInspector';
 import { ContextualAlternatesModal } from './ContextualAlternatesModal';
+import { CopyGlyphModal } from './CopyGlyphModal';
 import {
   renderCanvasVariableStrokes,
   drawStrokeWidthVisualIndicator,
@@ -161,6 +181,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     offsetX: 0,
     offsetY: 0,
     grayscale: true,
+    invert: false,
   });
   const [showUnderlayPanel, setShowUnderlayPanel] = useState<boolean>(false);
   const underlayImgRef = useRef<HTMLImageElement | null>(null);
@@ -178,10 +199,22 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
   const [showGuides, setShowGuides] = useState(true);
   const [showSlantGuides, setShowSlantGuides] = useState(true);
+
+  // Configurable Typographic Horizontal Baseline & Cap-Height Guide Overlay
+  const [guideConfig, setGuideConfig] = useState<GuideConfig>({
+    baseline: CANVAS_BASELINE, // default 600
+    capHeight: CANVAS_CAP_HEIGHT, // default 240
+    showOvershoot: true,
+    baselineColor: '#ef4444',
+    capHeightColor: '#3b82f6',
+    lineWidth: 1.8,
+  });
+  const [showGuideConfigPanel, setShowGuideConfigPanel] = useState<boolean>(false);
   const [activeGroup, setActiveGroup] = useState<string>('Uppercase');
   const [isCropModalOpen, setIsCropModalOpen] = useState(false);
   const [pastedImageSrc, setPastedImageSrc] = useState<string | null>(null);
   const [isDragOverCanvas, setIsDragOverCanvas] = useState(false);
+  const [canvasDropTarget, setCanvasDropTarget] = useState<'underlay' | 'crop'>('underlay');
 
   // Tool mode: Precision Pen vs Selective Segment Eraser
   const [drawingMode, setDrawingMode] = useState<'pen' | 'eraser'>('pen');
@@ -191,8 +224,32 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   const prevEraserPosRef = useRef<{ x: number; y: number } | null>(null);
   const hasPushedUndoForCurrentEraserDrag = useRef<boolean>(false);
 
-  // Pressure Intensity Heatmap visualization layer
+  // Visual pen pressure heatmap overlay: visualizes stroke pressure data on active character to refine penmanship consistency
   const [showPressureHeatmap, setShowPressureHeatmap] = useState<boolean>(false);
+  const [pressurePalette, setPressurePalette] = useState<PressureColorPalette>('penmanship-spectrum');
+  const [pressureOverlayAlpha, setPressureOverlayAlpha] = useState<number>(0.88);
+  const [showPressureBadges, setShowPressureBadges] = useState<boolean>(true);
+  const [showPressureSwellCalipers, setShowPressureSwellCalipers] = useState<boolean>(true);
+  const [showPressureTremorWarnings, setShowPressureTremorWarnings] = useState<boolean>(true);
+  const [pressureThicknessScale, setPressureThicknessScale] = useState<number>(1.25);
+  const [isPressureHUDCollapsed, setIsPressureHUDCollapsed] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 1024 : false
+  );
+  // Mobile Studio tab selector for screens < lg ('canvas' | 'matrix' | 'inspector')
+  const [mobileStudioTab, setMobileStudioTab] = useState<'canvas' | 'matrix' | 'inspector'>('canvas');
+
+  // Symmetry Guide: mirrors strokes horizontally across center axis to assist drawing symmetrical characters (e.g. O, A, M, H)
+  const [symmetryEnabled, setSymmetryEnabled] = useState<boolean>(false);
+  const [symmetryAxisMode, setSymmetryAxisMode] = useState<'metric' | 'canvas'>('metric');
+  const [symmetryAxisOffset, setSymmetryAxisOffset] = useState<number>(0);
+  const [showSymmetryPanel, setShowSymmetryPanel] = useState<boolean>(false);
+  const [hoverCanvasPt, setHoverCanvasPt] = useState<{ x: number; y: number } | null>(null);
+
+  // Common typographical characters with bilateral/horizontal reflective symmetry
+  const SYMMETRY_PRESET_CHARS = useMemo(
+    () => ['A', 'H', 'I', 'M', 'O', 'T', 'U', 'V', 'W', 'X', 'Y', 'o', 'v', 'w', 'x', '0', '8'],
+    []
+  );
 
   // Underlay file upload handler
   const handleUnderlayFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -202,41 +259,104 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     const reader = new FileReader();
     reader.onload = (event) => {
       const dataUrl = event.target?.result as string;
-      setUnderlay((prev) => ({ ...prev, src: dataUrl, visible: true }));
+      setUnderlay((prev) => ({
+        ...prev,
+        src: dataUrl,
+        visible: true,
+        invert: false,
+      }));
       setShowUnderlayPanel(true);
+      setBeautifyNotice(`Reference image imported! Ready to trace '${currentChar}'.`);
+      setTimeout(() => setBeautifyNotice(null), 3000);
     };
     reader.readAsDataURL(file);
     e.target.value = '';
   };
 
-  // Generate an instant calligraphic reference letter for the current character
-  const handleLoadSampleUnderlay = () => {
+  // Generate an instant reference underlay for complex character shapes
+  const handleLoadSampleUnderlay = (type: ComplexSampleType = 'italic') => {
     const offscreen = document.createElement('canvas');
     offscreen.width = 800;
     offscreen.height = 800;
     const offCtx = offscreen.getContext('2d');
-    if (offCtx) {
-      offCtx.fillStyle = '#ffffff';
-      offCtx.fillRect(0, 0, 800, 800);
-      offCtx.fillStyle = '#1e293b';
+    if (!offCtx) return;
+
+    offCtx.fillStyle = '#ffffff';
+    offCtx.fillRect(0, 0, 800, 800);
+    offCtx.fillStyle = '#0f172a';
+    offCtx.textAlign = 'center';
+    offCtx.textBaseline = 'alphabetic';
+
+    const targetBase = guideConfig.baseline;
+
+    if (type === 'italic') {
       offCtx.font = 'italic 520px "Georgia", "Times New Roman", serif';
-      offCtx.textAlign = 'center';
-      offCtx.textBaseline = 'alphabetic';
-      offCtx.fillText(currentChar, 400, CANVAS_BASELINE);
-      const dataUrl = offscreen.toDataURL('image/png');
-      setUnderlay({
-        src: dataUrl,
-        visible: true,
-        opacity: 0.35,
-        scale: 1.0,
-        offsetX: 0,
-        offsetY: 0,
-        grayscale: true,
-      });
-      setShowUnderlayPanel(true);
+      offCtx.fillText(currentChar, 400, targetBase);
+    } else if (type === 'blackletter') {
+      // Bold gothic blackletter textura style
+      offCtx.font = 'bold 500px "UnifrakturMaguntia", "Cloister Black", "Old English Text MT", "Didot", serif';
+      offCtx.fillText(currentChar, 400, targetBase);
+      offCtx.strokeStyle = '#0f172a';
+      offCtx.lineWidth = 14;
+      offCtx.beginPath();
+      offCtx.moveTo(250, targetBase + 8);
+      offCtx.lineTo(550, targetBase + 8);
+      offCtx.stroke();
+    } else if (type === 'kanji') {
+      // Complex multi-stroke character shape (繁 "flourishing/complex", or 龍 "dragon")
+      offCtx.font = '500px "Noto Serif JP", "Songti SC", "SimSun", "Yu Mincho", serif';
+      offCtx.fillText('繁', 400, targetBase);
+      // Subtle 4-quadrant guideline cross to help trace complex strokes
+      offCtx.strokeStyle = 'rgba(239, 68, 68, 0.4)';
+      offCtx.lineWidth = 2;
+      offCtx.setLineDash([6, 6]);
+      offCtx.beginPath();
+      offCtx.moveTo(400, 100);
+      offCtx.lineTo(400, 700);
+      offCtx.moveTo(100, 400);
+      offCtx.lineTo(700, 400);
+      offCtx.stroke();
+    } else if (type === 'flourished') {
+      // Ornate flourished initial with swirling calligraphic pen swashes
+      offCtx.font = 'italic 460px "Zapfino", "Bickham Script Pro", "Edwardian Script ITC", "Snell Roundhand", cursive, serif';
+      offCtx.fillText(currentChar, 400, targetBase);
+      // Decorative flourishes
+      offCtx.strokeStyle = '#0f172a';
+      offCtx.lineWidth = 4;
+      offCtx.beginPath();
+      offCtx.ellipse(400, targetBase - 120, 260, 200, Math.PI / 12, 0, Math.PI * 1.8);
+      offCtx.stroke();
+      offCtx.beginPath();
+      offCtx.arc(400, targetBase + 30, 180, 0.2 * Math.PI, 0.8 * Math.PI);
+      offCtx.stroke();
     }
+
+    const dataUrl = offscreen.toDataURL('image/png');
+    setUnderlay({
+      src: dataUrl,
+      visible: true,
+      opacity: 0.38,
+      scale: 1.0,
+      offsetX: 0,
+      offsetY: 0,
+      grayscale: true,
+      invert: false,
+    });
+    setShowUnderlayPanel(true);
+    setBeautifyNotice(`Loaded ${type} reference guide for tracing!`);
+    setTimeout(() => setBeautifyNotice(null), 2500);
   };
 
+  // Snap resting points of current character to the configured horizontal baseline
+  const handleSnapToConfiguredBaseline = () => {
+    if (currentStrokes.length === 0) return;
+    setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+    setRedoStack([]);
+    const snapped = snapGlyphToBaseline(currentChar, currentStrokes, guideConfig.baseline);
+    updateActiveStrokes(snapped);
+    setBeautifyNotice(`Snapped '${currentChar}' to ${guideConfig.baseline}px horizontal baseline`);
+    setTimeout(() => setBeautifyNotice(null), 2500);
+  };
 
   // Direct file upload handler from photo picker
   const handleStudioFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -263,8 +383,26 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       const reader = new FileReader();
       reader.onload = (event) => {
         const dataUrl = event.target?.result as string;
-        setPastedImageSrc(dataUrl);
-        setIsCropModalOpen(true);
+        if (canvasDropTarget === 'underlay') {
+          // Set directly as tracing background reference
+          setUnderlay({
+            src: dataUrl,
+            visible: true,
+            opacity: 0.45,
+            scale: 1.0,
+            offsetX: 0,
+            offsetY: 0,
+            grayscale: true,
+            invert: false,
+          });
+          setShowUnderlayPanel(true);
+          setBeautifyNotice(`Imported reference image for tracing '${currentChar}'!`);
+          setTimeout(() => setBeautifyNotice(null), 3000);
+        } else {
+          // Open crop and vectorizer modal
+          setPastedImageSrc(dataUrl);
+          setIsCropModalOpen(true);
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -312,6 +450,12 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   // Focus Mode state (distraction-free maximized drawing canvas with high contrast text)
   const [isFocusMode, setIsFocusMode] = useState<boolean>(false);
   const [isContextualModalOpen, setIsContextualModalOpen] = useState<boolean>(false);
+  const [isCopyGlyphModalOpen, setIsCopyGlyphModalOpen] = useState<boolean>(false);
+  const [glyphClipboard, setGlyphClipboard] = useState<{
+    char: string;
+    strokes: GlyphStroke[];
+    advanceWidth?: number;
+  } | null>(null);
 
   // Reset to primary variant when current character changes
   useEffect(() => {
@@ -404,9 +548,14 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     return getStrokesBoundingBox(currentStrokes);
   }, [currentStrokes]);
 
-  // Compute live stroke pressure statistics for the heatmap visualization layer
+  // Compute live stroke pressure statistics and pixel thicknesses for the Pressure Map
   const pressureStats = useMemo(() => {
-    return computeStrokesPressureStats(currentStrokes);
+    return computeStrokesPressureStats(currentStrokes, penSettings.baseWidth);
+  }, [currentStrokes, penSettings.baseWidth]);
+
+  // Compute penmanship consistency metrics from live stroke pressure data
+  const penmanshipMetrics = useMemo(() => {
+    return computePenmanshipConsistency(currentStrokes);
   }, [currentStrokes]);
 
   // Compute character horizontal bounding box center and baseline pivot point
@@ -415,8 +564,8 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       currentBBox !== null
         ? currentBBox.centerX
         : CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36;
-    return { pivotX: px, pivotY: CANVAS_BASELINE };
-  }, [currentBBox, currentGlyph.advanceWidth]);
+    return { pivotX: px, pivotY: guideConfig.baseline };
+  }, [currentBBox, currentGlyph.advanceWidth, guideConfig.baseline]);
 
   // Handler to adjust character-specific tilt independently of global slant
   const handleRotationChange = useCallback(
@@ -547,6 +696,50 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setTimeout(() => setBeautifyNotice(null), 2500);
   }, [currentStrokes, updateActiveStrokes, currentChar]);
 
+  // Calculate effective horizontal symmetry axis coordinate X
+  const effectiveSymmetryAxisX = useMemo(() => {
+    const base =
+      symmetryAxisMode === 'metric'
+        ? CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36
+        : CANVAS_SIZE / 2; // 400px
+    return Math.round(base + symmetryAxisOffset);
+  }, [symmetryAxisMode, currentGlyph.advanceWidth, symmetryAxisOffset]);
+
+  // Mirror one half of the glyph across the symmetry axis (Left → Right or Right → Left)
+  const handleMirrorSide = useCallback(
+    (sourceSide: 'left' | 'right') => {
+      if (currentStrokes.length === 0) return;
+      setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+      setRedoStack([]);
+
+      // Filter strokes that are predominantly on the source side (or mirror all if strokes span across)
+      const sourceStrokes = currentStrokes.filter((stroke) => {
+        if (stroke.length === 0) return false;
+        const avgX = stroke.reduce((sum, p) => sum + p.x, 0) / stroke.length;
+        return sourceSide === 'left'
+          ? avgX <= effectiveSymmetryAxisX + 12
+          : avgX >= effectiveSymmetryAxisX - 12;
+      });
+
+      const strokesToUse = sourceStrokes.length > 0 ? sourceStrokes : currentStrokes;
+      const mirroredStrokes: GlyphStroke[] = strokesToUse.map((stroke) =>
+        stroke.map((p) => ({
+          x: Math.round(2 * effectiveSymmetryAxisX - p.x),
+          y: p.y,
+          pressure: p.pressure,
+        }))
+      );
+
+      const combined = [...strokesToUse, ...mirroredStrokes];
+      updateActiveStrokes(combined);
+      setBeautifyNotice(
+        `Mirrored ${sourceSide === 'left' ? 'Left → Right' : 'Right → Left'} across symmetry axis (${combined.length} strokes)`
+      );
+      setTimeout(() => setBeautifyNotice(null), 2500);
+    },
+    [currentStrokes, effectiveSymmetryAxisX, updateActiveStrokes]
+  );
+
   // Center glyph strokes horizontally and vertically within the font's metric boundaries
   const handleCenterGlyph = useCallback(
     (mode?: CenteringVerticalMode) => {
@@ -652,6 +845,158 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
   const [beautifyNotice, setBeautifyNotice] = useState<string | null>(null);
 
+  // Copy stroke data between characters for rapid base shape borrowing and variant creation
+  const handleApplyCopyStrokes = useCallback(
+    (
+      sourceChar: string,
+      targetChar: string,
+      mode: 'replace' | 'append' | 'variant',
+      copyAdvanceWidth: boolean,
+      targetVariantName?: string
+    ) => {
+      const srcGlyph = glyphs[sourceChar];
+      if (!srcGlyph || !srcGlyph.strokes || srcGlyph.strokes.length === 0) return;
+
+      const clonedStrokes: GlyphStroke[] = JSON.parse(JSON.stringify(srcGlyph.strokes));
+      const tgtGlyph = glyphs[targetChar] || {
+        char: targetChar,
+        unicode: targetChar.charCodeAt(0),
+        strokes: [],
+        advanceWidth: 600,
+        leftBearing: 80,
+        rightBearing: 80,
+        lastModified: Date.now(),
+        variants: [],
+      };
+
+      const effectiveAdvance = copyAdvanceWidth
+        ? (srcGlyph.advanceWidth ?? 600)
+        : (tgtGlyph.advanceWidth ?? 600);
+
+      // If targetChar is the currently active currentChar
+      if (targetChar === currentChar) {
+        setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+        setRedoStack([]);
+
+        if (mode === 'replace') {
+          updateActiveStrokes(clonedStrokes, effectiveAdvance);
+          setBeautifyNotice(`Applied '${sourceChar}' strokes to '${currentChar}' (Base shape replaced)`);
+        } else if (mode === 'append') {
+          const merged = [...currentStrokes, ...clonedStrokes];
+          updateActiveStrokes(merged, effectiveAdvance);
+          setBeautifyNotice(`Appended ${clonedStrokes.length} strokes from '${sourceChar}' into '${currentChar}'`);
+        } else if (mode === 'variant') {
+          const newVariant: GlyphVariant = {
+            id: `var_${Date.now()}`,
+            name: targetVariantName || `Base '${sourceChar}'`,
+            strokes: clonedStrokes,
+            advanceWidth: effectiveAdvance,
+          };
+          const updatedVariants = [...variantsList, newVariant];
+          onUpdateGlyph(
+            currentChar,
+            currentGlyph.strokes,
+            currentGlyph.advanceWidth,
+            updatedVariants,
+            currentGlyph.rotation
+          );
+          setActiveVariantId(newVariant.id);
+          setBeautifyNotice(`Created new stylistic variant from '${sourceChar}' base shape`);
+        }
+      } else {
+        // Target is another character in the font
+        if (mode === 'replace') {
+          onUpdateGlyph(
+            targetChar,
+            clonedStrokes,
+            effectiveAdvance,
+            tgtGlyph.variants,
+            tgtGlyph.rotation
+          );
+        } else if (mode === 'append') {
+          const merged = [...(tgtGlyph.strokes || []), ...clonedStrokes];
+          onUpdateGlyph(
+            targetChar,
+            merged,
+            effectiveAdvance,
+            tgtGlyph.variants,
+            tgtGlyph.rotation
+          );
+        } else if (mode === 'variant') {
+          const newVariant: GlyphVariant = {
+            id: `var_${Date.now()}`,
+            name: targetVariantName || `Base '${sourceChar}'`,
+            strokes: clonedStrokes,
+            advanceWidth: effectiveAdvance,
+          };
+          onUpdateGlyph(
+            targetChar,
+            tgtGlyph.strokes,
+            tgtGlyph.advanceWidth,
+            [...(tgtGlyph.variants || []), newVariant],
+            tgtGlyph.rotation
+          );
+        }
+        setBeautifyNotice(`Copied strokes from '${sourceChar}' to '${targetChar}'`);
+      }
+
+      if (onRecordHistory) {
+        onRecordHistory(`Copied glyph strokes: '${sourceChar}' → '${targetChar}' (${mode})`);
+      }
+      setTimeout(() => setBeautifyNotice(null), 3000);
+    },
+    [glyphs, currentChar, currentStrokes, currentGlyph, variantsList, updateActiveStrokes, onUpdateGlyph, onRecordHistory]
+  );
+
+  // Batch copy current or source character to multiple destination characters
+  const handleBatchCopyToChars = useCallback(
+    (
+      sourceChar: string,
+      targetChars: string[],
+      mode: 'replace' | 'append' | 'variant',
+      copyAdvanceWidth: boolean
+    ) => {
+      const srcGlyph = glyphs[sourceChar];
+      if (!srcGlyph || !srcGlyph.strokes || srcGlyph.strokes.length === 0) return;
+
+      if (onUpdateAllGlyphs) {
+        const updated = { ...glyphs };
+        for (const tChar of targetChars) {
+          const cloned: GlyphStroke[] = JSON.parse(JSON.stringify(srcGlyph.strokes));
+          const existing = updated[tChar] || {
+            char: tChar,
+            unicode: tChar.charCodeAt(0),
+            strokes: [],
+            advanceWidth: 600,
+            leftBearing: 80,
+            rightBearing: 80,
+            lastModified: Date.now(),
+            variants: [],
+          };
+          const advance = copyAdvanceWidth ? (srcGlyph.advanceWidth ?? 600) : (existing.advanceWidth ?? 600);
+
+          if (mode === 'replace') {
+            updated[tChar] = { ...existing, strokes: cloned, advanceWidth: advance, lastModified: Date.now() };
+          } else if (mode === 'append') {
+            updated[tChar] = { ...existing, strokes: [...existing.strokes, ...cloned], advanceWidth: advance, lastModified: Date.now() };
+          } else if (mode === 'variant') {
+            const v: GlyphVariant = {
+              id: `var_${Date.now()}_${tChar}`,
+              name: `Base '${sourceChar}'`,
+              strokes: cloned,
+              advanceWidth: advance,
+            };
+            updated[tChar] = { ...existing, variants: [...(existing.variants || []), v], lastModified: Date.now() };
+          }
+        }
+        onUpdateAllGlyphs(updated);
+      }
+      setBeautifyNotice(`Batch copied '${sourceChar}' strokes to ${targetChars.length} characters (${targetChars.join(', ')})`);
+      setTimeout(() => setBeautifyNotice(null), 3000);
+    },
+    [glyphs, onUpdateAllGlyphs]
+  );
+
   // Smooth curves, reduce hand jitter, and snap baseline for current character/variant
   const handleBeautifyCurrent = () => {
     if (currentStrokes.length === 0) return;
@@ -680,6 +1025,38 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setBeautifyNotice('Smoothed curves & stabilized all characters in font!');
     setTimeout(() => setBeautifyNotice(null), 3000);
   };
+
+  // Balance pen pressure across all strokes of the glyph to smooth hand tremors and normalize thickness
+  const handleBalancePressure = useCallback(() => {
+    if (currentStrokes.length === 0) return;
+    setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+    setRedoStack([]);
+    const balanced = balanceStrokesPressure(currentStrokes, {
+      targetAverage: 0.85,
+      smoothRadius: 3,
+      contrastBoost: 1.0,
+    });
+    updateActiveStrokes(balanced);
+    if (onRecordHistory) {
+      onRecordHistory(`Balanced pen pressure on '${currentChar}'`);
+    }
+    setBeautifyNotice(`Balanced pen pressure across strokes on '${currentChar}'`);
+    setTimeout(() => setBeautifyNotice(null), 2500);
+  }, [currentStrokes, currentChar, updateActiveStrokes, onRecordHistory]);
+
+  // Boost dynamic calligraphic contrast (hairlines vs downstroke swells)
+  const handleBoostPressureContrast = useCallback(() => {
+    if (currentStrokes.length === 0) return;
+    setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+    setRedoStack([]);
+    const boosted = boostStrokesPressureContrast(currentStrokes);
+    updateActiveStrokes(boosted);
+    if (onRecordHistory) {
+      onRecordHistory(`Boosted pen pressure contrast on '${currentChar}'`);
+    }
+    setBeautifyNotice(`Boosted pen pressure contrast (hairlines vs swells) on '${currentChar}'`);
+    setTimeout(() => setBeautifyNotice(null), 2500);
+  }, [currentStrokes, currentChar, updateActiveStrokes, onRecordHistory]);
 
   // Redraw canvas on state changes
   const renderCanvas = useCallback(() => {
@@ -725,8 +1102,15 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       if (img.complete && img.naturalWidth > 0) {
         ctx.save();
         ctx.globalAlpha = Math.max(0.05, Math.min(1.0, underlay.opacity));
+        let filterStr = '';
         if (underlay.grayscale) {
-          ctx.filter = 'grayscale(100%) contrast(140%)';
+          filterStr += 'grayscale(100%) contrast(140%) ';
+        }
+        if (underlay.invert) {
+          filterStr += 'invert(100%) ';
+        }
+        if (filterStr) {
+          ctx.filter = filterStr.trim();
         }
 
         const baseW = img.naturalWidth;
@@ -756,11 +1140,12 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
       const angleRad = (slant * Math.PI) / 180;
       const tanSlant = Math.tan(angleRad);
+      const effectiveBase = guideConfig.baseline;
 
       for (let x = -CANVAS_SIZE; x < CANVAS_SIZE * 2; x += 120) {
         ctx.beginPath();
-        const topX = x + (CANVAS_BASELINE - 0) * tanSlant;
-        const botX = x + (CANVAS_BASELINE - CANVAS_SIZE) * tanSlant;
+        const topX = x + (effectiveBase - 0) * tanSlant;
+        const botX = x + (effectiveBase - CANVAS_SIZE) * tanSlant;
         ctx.moveTo(topX, 0);
         ctx.lineTo(botX, CANVAS_SIZE);
         ctx.stroke();
@@ -768,8 +1153,13 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       ctx.setLineDash([]);
     }
 
-    // Typographic guidelines
+    // Configurable typographic guidelines overlay
     if (showGuides) {
+      const effectiveBaseline = guideConfig.baseline;
+      const effectiveCapHeight = guideConfig.capHeight;
+      const effectiveCapDistance = effectiveBaseline - effectiveCapHeight;
+      const effectiveXHeight = Math.round(effectiveBaseline - effectiveCapDistance * 0.62);
+
       // Ascender line
       ctx.strokeStyle = '#93c5fd'; // Soft blue
       ctx.lineWidth = 1.2;
@@ -779,27 +1169,59 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       ctx.lineTo(CANVAS_SIZE - 40, CANVAS_ASCENDER);
       ctx.stroke();
 
-      // Cap Height line
-      ctx.strokeStyle = '#60a5fa'; // Blue
+      // Optical overshoot guides for curved letters (O, C, S, Q, G) if enabled (±8px)
+      if (guideConfig.showOvershoot) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(59, 130, 246, 0.28)'; // Soft blue overshoot band
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 4]);
+
+        // Cap-Height top overshoot line (-8px above cap height)
+        ctx.beginPath();
+        ctx.moveTo(40, effectiveCapHeight - 8);
+        ctx.lineTo(CANVAS_SIZE - 40, effectiveCapHeight - 8);
+        ctx.stroke();
+
+        // Baseline bottom overshoot line (+8px below baseline)
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.28)'; // Soft red overshoot band
+        ctx.beginPath();
+        ctx.moveTo(40, effectiveBaseline + 8);
+        ctx.lineTo(CANVAS_SIZE - 40, effectiveBaseline + 8);
+        ctx.stroke();
+
+        // Shaded subtle overshoot guide bands
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.04)';
+        ctx.fillRect(40, effectiveCapHeight - 8, CANVAS_SIZE - 80, 8);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.04)';
+        ctx.fillRect(40, effectiveBaseline, CANVAS_SIZE - 80, 8);
+        ctx.restore();
+      }
+
+      // Configurable Cap Height line
+      ctx.strokeStyle = guideConfig.capHeightColor || '#3b82f6';
+      ctx.lineWidth = guideConfig.lineWidth || 1.8;
+      ctx.setLineDash([8, 4]);
       ctx.beginPath();
-      ctx.moveTo(40, CANVAS_CAP_HEIGHT);
-      ctx.lineTo(CANVAS_SIZE - 40, CANVAS_CAP_HEIGHT);
+      ctx.moveTo(40, effectiveCapHeight);
+      ctx.lineTo(CANVAS_SIZE - 40, effectiveCapHeight);
       ctx.stroke();
 
-      // X-Height line
+      // Proportional x-Height line
       ctx.strokeStyle = '#f59e0b'; // Amber
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([6, 4]);
       ctx.beginPath();
-      ctx.moveTo(40, CANVAS_X_HEIGHT);
-      ctx.lineTo(CANVAS_SIZE - 40, CANVAS_X_HEIGHT);
+      ctx.moveTo(40, effectiveXHeight);
+      ctx.lineTo(CANVAS_SIZE - 40, effectiveXHeight);
       ctx.stroke();
 
-      // Baseline (solid grounded line)
-      ctx.strokeStyle = '#ef4444'; // Red baseline
-      ctx.lineWidth = 1.8;
+      // Configurable Baseline (grounded solid or prominent line)
+      ctx.strokeStyle = guideConfig.baselineColor || '#ef4444';
+      ctx.lineWidth = Math.max(2, (guideConfig.lineWidth || 1.8) + 0.4);
       ctx.setLineDash([]);
       ctx.beginPath();
-      ctx.moveTo(40, CANVAS_BASELINE);
-      ctx.lineTo(CANVAS_SIZE - 40, CANVAS_BASELINE);
+      ctx.moveTo(40, effectiveBaseline);
+      ctx.lineTo(CANVAS_SIZE - 40, effectiveBaseline);
       ctx.stroke();
 
       // Descender line
@@ -812,6 +1234,25 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       ctx.stroke();
 
       ctx.setLineDash([]);
+
+      // Capital height dimension caliper on right margin
+      ctx.save();
+      ctx.strokeStyle = 'rgba(99, 102, 241, 0.45)';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      const caliperX = CANVAS_SIZE - 45;
+      ctx.moveTo(caliperX - 6, effectiveCapHeight);
+      ctx.lineTo(caliperX, effectiveCapHeight);
+      ctx.lineTo(caliperX, effectiveBaseline);
+      ctx.lineTo(caliperX - 6, effectiveBaseline);
+      ctx.stroke();
+
+      // Caliper dimension text label
+      ctx.fillStyle = '#6366f1';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(`${effectiveCapDistance}px Cap`, caliperX - 8, (effectiveCapHeight + effectiveBaseline) / 2 + 3);
+      ctx.restore();
 
       // Advance width side bearings
       const leftX = CANVAS_ORIGIN_X;
@@ -848,7 +1289,11 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         currentGlyph.strokes,
         penSettings.baseWidth,
         penSettings.tool,
-        penSettings.pressureSensitivity
+        penSettings.pressureSensitivity,
+        '#1e293b',
+        penSettings.angle ?? 45,
+        penSettings.pressureCurve,
+        penSettings.pressureGamma
       );
       ctx.restore();
     }
@@ -873,7 +1318,10 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         penSettings.baseWidth,
         penSettings.tool,
         penSettings.pressureSensitivity,
-        ghostPath.color
+        ghostPath.color,
+        penSettings.angle ?? 45,
+        penSettings.pressureCurve,
+        penSettings.pressureGamma
       );
       ctx.restore();
 
@@ -986,7 +1434,11 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       currentStrokes,
       penSettings.baseWidth,
       penSettings.tool,
-      penSettings.pressureSensitivity
+      penSettings.pressureSensitivity,
+      '#1e293b',
+      penSettings.angle ?? 45,
+      penSettings.pressureCurve,
+      penSettings.pressureGamma
     );
 
     // Draw visual indicator showing stroke width variation along the path
@@ -1003,15 +1455,23 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
           showHeatmap: true,
           showMinMaxBadges: showMinMaxBadges,
           showCenterline: true,
-        }
+        },
+        penSettings.angle ?? 45
       );
     }
 
-    // Pressure Intensity Heatmap visualization layer
+    // Pressure Map visualization layer: renders stroke data with varying thicknesses to visualize & balance pen pressure
     if (showPressureHeatmap && currentStrokes.length > 0) {
       renderPressureHeatmapLayer(ctx, currentStrokes, penSettings.baseWidth, {
-        showNumericBadges: true,
+        palette: pressurePalette,
+        showNumericBadges: showPressureBadges,
         showGlow: true,
+        showUnderlineHalo: true,
+        alpha: pressureOverlayAlpha,
+        showSwellCalipers: showPressureSwellCalipers,
+        showTremorWarnings: showPressureTremorWarnings,
+        thicknessScale: pressureThicknessScale,
+        renderThicknessEnvelopes: true,
       });
     }
 
@@ -1120,6 +1580,117 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       ctx.restore();
     }
 
+    // -------------------------------------------------------------
+    // Symmetry Guide: Vertical Center Axis, Markers & Ghost Mirror Reticle
+    // -------------------------------------------------------------
+    if (symmetryEnabled) {
+      ctx.save();
+      const axisX = effectiveSymmetryAxisX;
+
+      // 1. Soft glowing background band for the symmetry line
+      ctx.fillStyle = 'rgba(99, 102, 241, 0.08)';
+      ctx.fillRect(axisX - 14, 30, 28, CANVAS_SIZE - 60);
+
+      // 2. Vertical symmetry axis dashed line
+      ctx.strokeStyle = '#6366f1'; // Indigo 500
+      ctx.lineWidth = 1.8;
+      ctx.setLineDash([6, 5]);
+      ctx.beginPath();
+      ctx.moveTo(axisX, 30);
+      ctx.lineTo(axisX, CANVAS_SIZE - 30);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // 3. Top & Bottom diamond markers
+      const drawDiamond = (cy: number) => {
+        ctx.fillStyle = '#4f46e5';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(axisX, cy - 7);
+        ctx.lineTo(axisX + 7, cy);
+        ctx.lineTo(axisX, cy + 7);
+        ctx.lineTo(axisX - 7, cy);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      };
+      drawDiamond(30);
+      drawDiamond(CANVAS_SIZE - 30);
+
+      // 4. Symmetry Axis Badge Callout at top
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'center';
+      const symLabel = `Symmetry Axis · X: ${axisX}px (${symmetryAxisMode === 'metric' ? 'Metric' : 'Canvas'})`;
+      const symTextMetrics = ctx.measureText(symLabel);
+      const symTextW = symTextMetrics.width;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+      ctx.beginPath();
+      ctx.roundRect(axisX - symTextW / 2 - 8, 12, symTextW + 16, 17, 4);
+      ctx.fill();
+      ctx.fillStyle = '#e0e7ff';
+      ctx.fillText(symLabel, axisX, 24);
+
+      // 5. Mirrored eraser reticle when eraser mode is active
+      if (drawingMode === 'eraser' && eraserCursor && eraserCursor.visible) {
+        const mirrorEraserX = Math.round(2 * axisX - eraserCursor.x);
+        const isSegment = eraserSubMode === 'segment';
+        ctx.strokeStyle = isSegment ? '#f43f5e' : '#f97316';
+        ctx.fillStyle = isSegment ? 'rgba(244, 63, 94, 0.12)' : 'rgba(249, 115, 22, 0.15)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(mirrorEraserX, eraserCursor.y, eraserRadius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // 6. Real-time Ghost Mirror Reticle when hovering pen
+      if (hoverCanvasPt && drawingMode === 'pen') {
+        const mirrorHoverX = Math.round(2 * axisX - hoverCanvasPt.x);
+        const mirrorHoverY = hoverCanvasPt.y;
+
+        // Connecting hairline between cursor and mirror reticle
+        ctx.strokeStyle = 'rgba(99, 102, 241, 0.35)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 4]);
+        ctx.beginPath();
+        ctx.moveTo(hoverCanvasPt.x, hoverCanvasPt.y);
+        ctx.lineTo(mirrorHoverX, mirrorHoverY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Ghost mirror reticle ring
+        const reticleR = Math.max(4, penSettings.baseWidth / 2);
+        ctx.strokeStyle = '#6366f1';
+        ctx.fillStyle = 'rgba(99, 102, 241, 0.18)';
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.arc(mirrorHoverX, mirrorHoverY, reticleR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        // Center dot
+        ctx.fillStyle = '#4f46e5';
+        ctx.beginPath();
+        ctx.arc(mirrorHoverX, mirrorHoverY, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Mirror label badge
+        ctx.fillStyle = 'rgba(79, 70, 229, 0.9)';
+        ctx.beginPath();
+        ctx.roundRect(mirrorHoverX + 8, mirrorHoverY - 14, 42, 14, 3);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 8px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('MIRROR', mirrorHoverX + 11, mirrorHoverY - 4);
+      }
+
+      ctx.restore();
+    }
+
     if (charRotation !== 0) {
       ctx.restore();
     }
@@ -1150,6 +1721,13 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     showWidthCalipers,
     showMinMaxBadges,
     showPressureHeatmap,
+    pressurePalette,
+    pressureOverlayAlpha,
+    showPressureBadges,
+    showPressureSwellCalipers,
+    showPressureTremorWarnings,
+    pressureThicknessScale,
+    guideConfig,
     drawingMode,
     eraserSubMode,
     eraserRadius,
@@ -1162,6 +1740,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     underlay.offsetX,
     underlay.offsetY,
     underlay.grayscale,
+    underlay.invert,
     ghostPath,
     hasGhostStrokes,
     ghostGlyph,
@@ -1176,6 +1755,10 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     showBoundingBox,
     currentBBox,
     isFocusMode,
+    symmetryEnabled,
+    symmetryAxisMode,
+    effectiveSymmetryAxisX,
+    hoverCanvasPt,
   ]);
 
   // Load underlay image into underlayImgRef whenever underlay.src changes
@@ -1234,6 +1817,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     e.currentTarget.setPointerCapture(e.pointerId);
     setIsDrawing(true);
     const pt = getCanvasPoint(e);
+    setHoverCanvasPt(pt);
 
     const isStylusEraser = (e.buttons & 32) !== 0 || e.button === 5;
     const effectiveEraser = drawingMode === 'eraser' || isStylusEraser;
@@ -1245,10 +1829,22 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       setEraserCursor({ x: pt.x, y: pt.y, visible: true });
 
       if (currentStrokes.length > 0) {
-        const result =
+        let result =
           eraserSubMode === 'segment'
             ? eraseStrokeSegments(currentStrokes, pt.x, pt.y, eraserRadius)
             : eraseWholeStrokesAtPoint(currentStrokes, pt.x, pt.y, eraserRadius);
+
+        // Also erase mirrored side if symmetry guide is enabled
+        if (symmetryEnabled) {
+          const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
+          const symResult =
+            eraserSubMode === 'segment'
+              ? eraseStrokeSegments(result.strokes, mirrorX, pt.y, eraserRadius)
+              : eraseWholeStrokesAtPoint(result.strokes, mirrorX, pt.y, eraserRadius);
+          if (symResult.changed) {
+            result = { strokes: symResult.strokes, changed: true };
+          }
+        }
 
         if (result.changed) {
           setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
@@ -1274,12 +1870,23 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     // Save deep-cloned state to undo stack before stroke begins
     setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
     setRedoStack([]);
-    const newStrokes = [...currentStrokes, [pt]];
-    updateActiveStrokes(newStrokes);
+
+    if (symmetryEnabled) {
+      const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
+      const mirrorPt = { x: mirrorX, y: pt.y, pressure: pt.pressure };
+      // Push both primary stroke and mirrored stroke in tandem
+      const newStrokes = [...currentStrokes, [pt], [mirrorPt]];
+      updateActiveStrokes(newStrokes);
+    } else {
+      const newStrokes = [...currentStrokes, [pt]];
+      updateActiveStrokes(newStrokes);
+    }
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const pt = getCanvasPoint(e);
+    setHoverCanvasPt(pt);
+
     const isStylusEraser = (e.buttons & 32) !== 0 || e.button === 5;
     const effectiveEraser = drawingMode === 'eraser' || isStylusEraser;
 
@@ -1303,8 +1910,35 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
           } else {
             result = eraseStrokeSegments(currentStrokes, pt.x, pt.y, eraserRadius);
           }
+
+          if (symmetryEnabled) {
+            const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
+            const prevMirrorX = prevEraserPosRef.current
+              ? Math.round(2 * effectiveSymmetryAxisX - prevEraserPosRef.current.x)
+              : mirrorX;
+            const symResult = prevEraserPosRef.current
+              ? eraseStrokeSegmentsAlongPath(
+                  result.strokes,
+                  prevMirrorX,
+                  prevEraserPosRef.current.y,
+                  mirrorX,
+                  pt.y,
+                  eraserRadius
+                )
+              : eraseStrokeSegments(result.strokes, mirrorX, pt.y, eraserRadius);
+            if (symResult.changed) {
+              result = { strokes: symResult.strokes, changed: true };
+            }
+          }
         } else {
           result = eraseWholeStrokesAtPoint(currentStrokes, pt.x, pt.y, eraserRadius);
+          if (symmetryEnabled) {
+            const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
+            const symResult = eraseWholeStrokesAtPoint(result.strokes, mirrorX, pt.y, eraserRadius);
+            if (symResult.changed) {
+              result = { strokes: symResult.strokes, changed: true };
+            }
+          }
         }
 
         if (result.changed) {
@@ -1332,14 +1966,53 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     const strokes = [...currentStrokes];
     if (strokes.length === 0) return;
 
+    if (symmetryEnabled) {
+      if (strokes.length < 2) return;
+      const primaryStroke = [...strokes[strokes.length - 2]];
+      const mirrorStroke = [...strokes[strokes.length - 1]];
+      const lastPt = primaryStroke[primaryStroke.length - 1];
+      if (!lastPt) return;
+
+      // Dynamic speed & downstroke response
+      if (e.pointerType !== 'pen' && penSettings.pressureSensitivity) {
+        const dy = pt.y - lastPt.y;
+        const dx = pt.x - lastPt.x;
+        const dist = Math.hypot(dx, dy) || 1;
+        const downwardness = dy / dist;
+        let dynamicPressure = 0.9;
+        if (downwardness > 0.25) {
+          dynamicPressure = 1.0 + downwardness * 0.45;
+        } else if (downwardness < -0.25) {
+          dynamicPressure = 0.62;
+        }
+        pt.pressure = Math.round(dynamicPressure * 100) / 100;
+      }
+
+      const smoothingVal = typeof penSettings.smoothing === 'number' ? penSettings.smoothing : 0.5;
+      const stabilizedPt = stabilizePointRealtime(pt, lastPt, smoothingVal);
+      if (!stabilizedPt) return;
+
+      const mirrorPt = {
+        x: Math.round(2 * effectiveSymmetryAxisX - stabilizedPt.x),
+        y: stabilizedPt.y,
+        pressure: stabilizedPt.pressure,
+      };
+
+      primaryStroke.push(stabilizedPt);
+      mirrorStroke.push(mirrorPt);
+
+      strokes[strokes.length - 2] = primaryStroke;
+      strokes[strokes.length - 1] = mirrorStroke;
+      updateActiveStrokes(strokes);
+      return;
+    }
+
     const activeStroke = [...strokes[strokes.length - 1]];
     const lastPt = activeStroke[activeStroke.length - 1];
-
-    // Minimal distance filter to avoid jitter
-    if (lastPt && Math.hypot(pt.x - lastPt.x, pt.y - lastPt.y) < 3) return;
+    if (!lastPt) return;
 
     // For mouse/trackpad drawing with pressure sensitivity on: dynamic speed & downstroke response
-    if (e.pointerType !== 'pen' && penSettings.pressureSensitivity && lastPt) {
+    if (e.pointerType !== 'pen' && penSettings.pressureSensitivity) {
       const dy = pt.y - lastPt.y;
       const dx = pt.x - lastPt.x;
       const dist = Math.hypot(dx, dy) || 1;
@@ -1353,7 +2026,12 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       pt.pressure = Math.round(dynamicPressure * 100) / 100;
     }
 
-    activeStroke.push(pt);
+    // Real-time stroke smoothing & stabilization filter based on penSettings.smoothing
+    const smoothingVal = typeof penSettings.smoothing === 'number' ? penSettings.smoothing : 0.5;
+    const stabilizedPt = stabilizePointRealtime(pt, lastPt, smoothingVal);
+    if (!stabilizedPt) return; // Micro-jitter below threshold filtered out
+
+    activeStroke.push(stabilizedPt);
     strokes[strokes.length - 1] = activeStroke;
     updateActiveStrokes(strokes);
   };
@@ -1363,6 +2041,36 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setIsDrawing(false);
     prevEraserPosRef.current = null;
     hasPushedUndoForCurrentEraserDrag.current = false;
+
+    // Finalize stroke with curve relaxation based on penSettings.smoothing
+    const smoothingVal = typeof penSettings.smoothing === 'number' ? penSettings.smoothing : 0.5;
+    if (drawingMode === 'pen' && smoothingVal >= 0.15 && currentStrokes.length > 0) {
+      const strokes = [...currentStrokes];
+
+      if (symmetryEnabled && strokes.length >= 2) {
+        const primaryStroke = strokes[strokes.length - 2];
+        if (primaryStroke && primaryStroke.length >= 3) {
+          const finalizedPrimary = finalizeStrokeWithSmoothing(primaryStroke, smoothingVal);
+          // Mirror finalized primary curve points to preserve 100% mathematical symmetry
+          const finalizedMirror = finalizedPrimary.map((p) => ({
+            x: Math.round(2 * effectiveSymmetryAxisX - p.x),
+            y: p.y,
+            pressure: p.pressure,
+          }));
+          strokes[strokes.length - 2] = finalizedPrimary;
+          strokes[strokes.length - 1] = finalizedMirror;
+          updateActiveStrokes(strokes);
+        }
+      } else {
+        const activeStroke = strokes[strokes.length - 1];
+        if (activeStroke && activeStroke.length >= 3) {
+          const finalized = finalizeStrokeWithSmoothing(activeStroke, smoothingVal);
+          strokes[strokes.length - 1] = finalized;
+          updateActiveStrokes(strokes);
+        }
+      }
+    }
+
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
@@ -1372,6 +2080,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
   const handlePointerLeave = () => {
     setEraserCursor(null);
+    setHoverCanvasPt(null);
     prevEraserPosRef.current = null;
   };
 
@@ -1380,11 +2089,14 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     if (currentStrokes.length === 0) return;
     setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
     setRedoStack([]);
-    const updated = currentStrokes.slice(0, -1);
+    const countToDelete = symmetryEnabled && currentStrokes.length >= 2 ? 2 : 1;
+    const updated = currentStrokes.slice(0, -countToDelete);
     updateActiveStrokes(updated);
-    setBeautifyNotice(`Deleted stroke (${updated.length} left). Revert with Undo [Ctrl+Z].`);
+    setBeautifyNotice(
+      `Deleted ${countToDelete === 2 ? 'mirrored stroke pair' : 'stroke'} (${updated.length} left). Revert with Undo [Ctrl+Z].`
+    );
     setTimeout(() => setBeautifyNotice(null), 2500);
-  }, [currentStrokes, updateActiveStrokes]);
+  }, [currentStrokes, updateActiveStrokes, symmetryEnabled]);
 
   const handleClear = () => {
     if (currentStrokes.length === 0) return;
@@ -1486,10 +2198,35 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         setTimeout(() => setBeautifyNotice(null), 1500);
         return;
       }
-      // M: Toggle Pressure Heatmap
+      // M: Toggle Pressure Map
       if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
-        setShowPressureHeatmap((prev) => !prev);
+        setShowPressureHeatmap((prev) => {
+          const next = !prev;
+          setBeautifyNotice(
+            next
+              ? 'Pressure Map Overlay ON: Visualizing variable thickness & pressure balance [M]'
+              : 'Pressure Map Overlay OFF'
+          );
+          setTimeout(() => setBeautifyNotice(null), 2000);
+          return next;
+        });
+        return;
+      }
+
+      // S: Toggle Symmetry Guide (horizontal mirroring across center axis)
+      if ((e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setSymmetryEnabled((prev) => {
+          const next = !prev;
+          setBeautifyNotice(
+            next
+              ? `Symmetry Guide ON: horizontal mirroring active at X=${effectiveSymmetryAxisX}px [S]`
+              : 'Symmetry Guide OFF'
+          );
+          setTimeout(() => setBeautifyNotice(null), 2000);
+          return next;
+        });
         return;
       }
 
@@ -1541,6 +2278,28 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
           // Tilt character right (increase rotation)
           handleRotationChange(Math.min(30, charRotation + 1));
         }
+      } else if (e.altKey && (e.key === 'c' || e.key === 'C')) {
+        // Alt+C: Open Copy Glyph & Base Shapes Modal
+        e.preventDefault();
+        setIsCopyGlyphModalOpen(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
+        // Ctrl+Shift+C: Quick copy current character strokes to clipboard
+        e.preventDefault();
+        if (currentStrokes.length > 0) {
+          setGlyphClipboard({
+            char: currentChar,
+            strokes: JSON.parse(JSON.stringify(currentStrokes)),
+            advanceWidth: currentGlyph.advanceWidth || 600,
+          });
+          setBeautifyNotice(`Copied '${currentChar}' (${currentStrokes.length} strokes) to clipboard!`);
+          setTimeout(() => setBeautifyNotice(null), 2500);
+        }
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
+        // Ctrl+Shift+V: Quick paste strokes from clipboard
+        e.preventDefault();
+        if (glyphClipboard && glyphClipboard.strokes.length > 0) {
+          handleApplyCopyStrokes(glyphClipboard.char, currentChar, 'replace', true);
+        }
       } else if (e.key === 'c' || e.key === 'C') {
         // Center glyph strokes within metric boundaries
         e.preventDefault();
@@ -1580,17 +2339,70 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     handleMirrorHorizontal,
     handleMirrorVertical,
     handleCenterGlyph,
+    handleApplyCopyStrokes,
+    glyphClipboard,
+    currentChar,
+    currentGlyph.advanceWidth,
     allChars,
     onSelectChar,
     isFocusMode,
   ]);
 
   return (
-    <div className="flex flex-col lg:flex-row h-[calc(100vh-61px)] bg-slate-50 overflow-hidden">
+    <div className="flex flex-col lg:flex-row h-[calc(100vh-61px)] bg-slate-50 overflow-hidden relative">
+      {/* Mobile Studio Segmented View Tabs (Visible on screens < lg) */}
+      {!isFocusMode && (
+        <div className="lg:hidden flex items-center justify-between px-3 py-2 bg-white border-b border-slate-200 shadow-2xs z-30 sticky top-0 shrink-0">
+          <div className="flex items-center gap-1 p-0.5 bg-slate-100 rounded-lg flex-1">
+            <button
+              onClick={() => setMobileStudioTab('canvas')}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md text-xs font-semibold transition-all ${
+                mobileStudioTab === 'canvas'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <PenTool className="w-3.5 h-3.5 text-indigo-600" />
+              <span>Canvas</span>
+              <span className="font-mono text-[10px] text-slate-500 font-bold">('{currentChar}')</span>
+            </button>
+            <button
+              onClick={() => setMobileStudioTab('matrix')}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md text-xs font-semibold transition-all ${
+                mobileStudioTab === 'matrix'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <LayoutGrid className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Glyphs</span>
+              <span className="font-mono text-[10px] text-slate-500">
+                {Object.values(glyphs).filter((g) => g.strokes.length > 0).length}/{allChars.length}
+              </span>
+            </button>
+            <button
+              onClick={() => setMobileStudioTab('inspector')}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md text-xs font-semibold transition-all ${
+                mobileStudioTab === 'inspector'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Sliders className="w-3.5 h-3.5 text-amber-600" />
+              <span>Inspect & Tools</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Left Column: Character Matrix Navigator */}
       <aside
         className={`w-full lg:w-72 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex-col shrink-0 transition-all ${
-          isFocusMode ? 'hidden' : 'flex'
+          isFocusMode
+            ? 'hidden'
+            : mobileStudioTab === 'matrix'
+            ? 'flex flex-1 min-h-0'
+            : 'hidden lg:flex'
         }`}
       >
         <div className="p-4 border-b border-slate-200">
@@ -1643,7 +2455,10 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             return (
               <button
                 key={char}
-                onClick={() => onSelectChar(char)}
+                onClick={() => {
+                  onSelectChar(char);
+                  setMobileStudioTab('canvas');
+                }}
                 className={`relative aspect-square flex flex-col items-center justify-center rounded-lg border transition-all ${
                   isSelected
                     ? 'border-slate-900 bg-slate-900 text-white shadow-md'
@@ -1668,37 +2483,45 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         {/* Quick Tips Box */}
         <div className="p-3.5 border-t border-slate-200 bg-slate-50/80 text-xs text-slate-600 space-y-1.5">
           <div className="flex items-center justify-between font-medium text-slate-800">
-            <span>Keyboard Shortcuts</span>
-            <span className="text-[10px] text-slate-500 font-mono">← / →</span>
+            <span>Quick Tip</span>
+            <span className="text-[10px] text-slate-500 font-mono">Tap to draw</span>
           </div>
           <p className="text-[11px] leading-relaxed text-slate-500">
-            Use <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">←</kbd>/<kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">→</kbd> cycle letters. <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">C</kbd> center glyph. <kbd className="px-1 py-0.5 bg-white border border-slate-200 rounded text-[10px] font-mono">Ctrl+Z</kbd> undo.
+            Select any character to immediately open the drawing canvas and start vectorizing your penmanship.
           </p>
         </div>
       </aside>
 
       {/* Center: Tactile Drawing Canvas */}
-      <main className="flex-1 flex flex-col overflow-hidden bg-slate-100">
+      <main
+        className={`flex-1 flex-col overflow-y-auto lg:overflow-hidden bg-slate-100 ${
+          isFocusMode || mobileStudioTab === 'canvas' ? 'flex' : 'hidden lg:flex'
+        }`}
+      >
         {/* Workspace Toolbar */}
-        <div className="flex items-center justify-between px-6 py-2.5 bg-white border-b border-slate-200 gap-4 flex-wrap">
+        <div className="flex items-center justify-between px-3 sm:px-6 py-2 sm:py-2.5 bg-white border-b border-slate-200 gap-2 sm:gap-4 flex-wrap">
           {/* Active Letter & Navigation */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             <div className="flex items-center gap-1">
               <button
                 onClick={goToPrev}
                 disabled={currentIndex === 0}
-                className="p-1.5 rounded-md hover:bg-slate-100 disabled:opacity-30 text-slate-700 transition-colors"
+                className="p-1.5 sm:p-2 rounded-md hover:bg-slate-100 disabled:opacity-30 text-slate-700 transition-colors"
                 title="Previous character (Left Arrow)"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
-              <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-slate-900 text-white font-bold text-xl shadow-inner font-['Plus_Jakarta_Sans']">
+              <button
+                onClick={() => setMobileStudioTab('matrix')}
+                className="flex items-center justify-center w-9 sm:w-10 h-9 sm:h-10 rounded-lg bg-slate-900 text-white font-bold text-lg sm:text-xl shadow-inner font-['Plus_Jakarta_Sans'] hover:bg-slate-800 transition-colors cursor-pointer"
+                title="Click to browse all characters in matrix"
+              >
                 {currentChar}
-              </div>
+              </button>
               <button
                 onClick={goToNext}
                 disabled={currentIndex === allChars.length - 1}
-                className="p-1.5 rounded-md hover:bg-slate-100 disabled:opacity-30 text-slate-700 transition-colors"
+                className="p-1.5 sm:p-2 rounded-md hover:bg-slate-100 disabled:opacity-30 text-slate-700 transition-colors"
                 title="Next character (Right Arrow)"
               >
                 <ChevronRight className="w-4 h-4" />
@@ -1820,24 +2643,198 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg shrink-0">
               {(
                 [
-                  { id: 'fountain', label: 'Fountain Pen' },
-                  { id: 'rollerball', label: 'Gel Pen' },
-                  { id: 'drafting', label: 'Drafting 0.5' },
-                  { id: 'calligraphy', label: 'Broad Nib' },
+                  { id: 'calligraphy', label: 'Calligraphy', isCallig: true },
+                  { id: 'fountain', label: 'Fountain Pen', isCallig: false },
+                  { id: 'rollerball', label: 'Gel Pen', isCallig: false },
+                  { id: 'drafting', label: 'Drafting 0.5', isCallig: false },
                 ] as const
               ).map((tool) => (
                 <button
                   key={tool.id}
                   onClick={() => setPenSettings((prev) => ({ ...prev, tool: tool.id }))}
-                  className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap ${
+                  className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap ${
                     penSettings.tool === tool.id
-                      ? 'bg-white text-slate-900 shadow-sm font-semibold'
+                      ? tool.id === 'calligraphy'
+                        ? 'bg-amber-600 text-white shadow-sm font-semibold'
+                        : 'bg-white text-slate-900 shadow-sm font-semibold'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
+                  title={
+                    tool.id === 'calligraphy'
+                      ? 'Calligraphy Brush: Dynamic stroke width based on pen travel direction to simulate fountain pen nib characteristics'
+                      : undefined
+                  }
                 >
-                  {tool.label}
+                  {tool.id === 'calligraphy' && <Feather className="w-3 h-3" />}
+                  <span>{tool.label}</span>
                 </button>
               ))}
+            </div>
+          )}
+
+          {/* Calligraphy Brush Tool Nib Angle & Direction Setting Widget */}
+          {drawingMode === 'pen' && penSettings.tool === 'calligraphy' && (
+            <div className="flex items-center gap-2 px-2.5 py-1 bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200/90 rounded-lg text-xs shadow-2xs shrink-0 animate-in fade-in duration-150">
+              {/* Nib Angle Visual Compass */}
+              <div className="flex items-center gap-1.5 text-amber-950 font-semibold">
+                <div
+                  className="w-5 h-5 rounded-full bg-amber-200/70 border border-amber-300 flex items-center justify-center relative shadow-inner"
+                  title={`Calligraphic Chisel Nib oriented at ${penSettings.angle ?? 45}°`}
+                >
+                  {/* Rotating Nib Chisel Line */}
+                  <div
+                    className="w-3.5 h-[2.5px] bg-amber-900 rounded-full transition-transform duration-100"
+                    style={{ transform: `rotate(${-((penSettings.angle ?? 45))}deg)` }}
+                  />
+                </div>
+                <span>Nib Angle:</span>
+              </div>
+
+              {/* Angle Slider */}
+              <input
+                type="range"
+                min="0"
+                max="90"
+                step="5"
+                value={penSettings.angle ?? 45}
+                onChange={(e) =>
+                  setPenSettings((prev) => ({
+                    ...prev,
+                    angle: Number(e.target.value),
+                  }))
+                }
+                className="w-18 accent-amber-600 cursor-pointer"
+                title="Adjust Calligraphy Fountain Pen Nib angle (0° to 90°). Strokes parallel to the nib are hairline thin; strokes perpendicular are broad."
+              />
+
+              {/* Angle Readout & Nudges */}
+              <div className="flex items-center gap-0.5 bg-white px-1.5 py-0.5 rounded border border-amber-300 font-mono text-[11px] font-bold text-amber-900 shadow-2xs">
+                <span>{penSettings.angle ?? 45}°</span>
+                <div className="flex flex-col -my-0.5 ml-1">
+                  <button
+                    onClick={() =>
+                      setPenSettings((prev) => ({
+                        ...prev,
+                        angle: Math.min(90, (prev.angle ?? 45) + 5),
+                      }))
+                    }
+                    className="leading-none text-[8px] text-amber-700 hover:text-amber-950 font-black"
+                    title="Nudge angle +5°"
+                  >
+                    ▲
+                  </button>
+                  <button
+                    onClick={() =>
+                      setPenSettings((prev) => ({
+                        ...prev,
+                        angle: Math.max(0, (prev.angle ?? 45) - 5),
+                      }))
+                    }
+                    className="leading-none text-[8px] text-amber-700 hover:text-amber-950 font-black"
+                    title="Nudge angle -5°"
+                  >
+                    ▼
+                  </button>
+                </div>
+              </div>
+
+              {/* Quick Calligraphy Angle Presets */}
+              <div className="hidden lg:flex items-center gap-1 p-0.5 bg-white rounded border border-amber-200">
+                {[
+                  { angle: 45, label: 'Italic (45°)', title: 'Italic 45°: Classic Chancery Renaissance cursive' },
+                  { angle: 30, label: 'Roman (30°)', title: 'Foundational 30°: Wide circular bowls & upright stems' },
+                  { angle: 40, label: 'Gothic (40°)', title: 'Blackletter 40°: Dense vertical gothic textura' },
+                  { angle: 52, label: 'Spencerian (52°)', title: 'Copperplate 52°: Delicate calligraphic flourish slant' },
+                  { angle: 0, label: 'Flat (0°)', title: 'Horizontal 0°: Heavy vertical downstrokes & hairline crossbars' },
+                ].map((preset) => {
+                  const isCur = (penSettings.angle ?? 45) === preset.angle;
+                  return (
+                    <button
+                      key={preset.angle}
+                      onClick={() => setPenSettings((prev) => ({ ...prev, angle: preset.angle }))}
+                      className={`px-1.5 py-0.5 text-[10px] font-semibold rounded transition-colors ${
+                        isCur
+                          ? 'bg-amber-600 text-white shadow-2xs font-bold'
+                          : 'text-amber-800 hover:bg-amber-100/70'
+                      }`}
+                      title={preset.title}
+                    >
+                      {preset.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Real-time Stroke Smoothing & Path Stabilizer Slider */}
+          {drawingMode === 'pen' && (
+            <div className="flex items-center gap-2 px-2.5 py-1 bg-slate-100/90 border border-slate-200/90 rounded-lg text-xs shadow-2xs shrink-0">
+              <div className="flex items-center gap-1 text-slate-700">
+                <Sliders className="w-3.5 h-3.5 text-indigo-600" />
+                <span className="font-semibold text-slate-800">Stabilizer:</span>
+              </div>
+
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={penSettings.smoothing ?? 0.5}
+                onChange={(e) =>
+                  setPenSettings((prev) => ({
+                    ...prev,
+                    smoothing: parseFloat(e.target.value),
+                  }))
+                }
+                className="w-20 md:w-24 accent-indigo-600 cursor-pointer"
+                title="Real-time stroke smoothing stabilizer: 0% records raw authentic tremors and angular jitter, 100% creates silk-smooth stabilized calligraphic curves"
+              />
+
+              <span
+                className={`font-mono text-[11px] font-bold px-1.5 py-0.5 rounded min-w-[76px] text-center tabular-nums border ${
+                  (penSettings.smoothing ?? 0.5) === 0
+                    ? 'bg-amber-50 text-amber-900 border-amber-300'
+                    : (penSettings.smoothing ?? 0.5) >= 0.8
+                    ? 'bg-indigo-50 text-indigo-900 border-indigo-300'
+                    : 'bg-white text-slate-800 border-slate-200'
+                }`}
+                title={`Stabilization level: ${Math.round((penSettings.smoothing ?? 0.5) * 100)}%`}
+              >
+                {(penSettings.smoothing ?? 0.5) === 0
+                  ? 'Raw (0%)'
+                  : (penSettings.smoothing ?? 0.5) <= 0.35
+                  ? `${Math.round((penSettings.smoothing ?? 0.5) * 100)}% (Nat)`
+                  : (penSettings.smoothing ?? 0.5) <= 0.7
+                  ? `${Math.round((penSettings.smoothing ?? 0.5) * 100)}% (Smooth)`
+                  : `${Math.round((penSettings.smoothing ?? 0.5) * 100)}% (Stab)`}
+              </span>
+
+              {/* Quick Preset Buttons */}
+              <div className="hidden xl:flex items-center gap-0.5 p-0.5 bg-white rounded border border-slate-200">
+                {[
+                  { label: 'Raw', val: 0, title: 'Raw (0%): Unfiltered authentic handwriting tremors' },
+                  { label: 'Nat', val: 0.35, title: 'Natural (35%): Subtle jitter reduction' },
+                  { label: 'Smooth', val: 0.65, title: 'Smooth (65%): Fluid cursive stabilization' },
+                  { label: 'Stab', val: 0.95, title: 'Stabilized (95%): High calligraphic stabilization' },
+                ].map((preset) => {
+                  const isCurrent = Math.abs((penSettings.smoothing ?? 0.5) - preset.val) < 0.1;
+                  return (
+                    <button
+                      key={preset.label}
+                      onClick={() => setPenSettings((prev) => ({ ...prev, smoothing: preset.val }))}
+                      className={`px-1.5 py-0.5 text-[10px] font-bold rounded transition-colors ${
+                        isCurrent
+                          ? 'bg-indigo-600 text-white shadow-2xs'
+                          : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                      }`}
+                      title={preset.title}
+                    >
+                      {preset.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -1865,18 +2862,34 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <span>Pressure {penSettings.pressureSensitivity ? 'ON' : 'OFF'}</span>
             </button>
 
-            {/* Pressure Intensity Heatmap Toggle Button */}
+            {/* Pressure Map (Stroke Thickness & Pressure Balance) Visualization Toggle Button */}
             <button
-              onClick={() => setShowPressureHeatmap((prev) => !prev)}
+              onClick={() => {
+                setShowPressureHeatmap((prev) => {
+                  const next = !prev;
+                  setBeautifyNotice(
+                    next
+                      ? 'Pressure Map Overlay ON: Visualizing variable thickness and pressure balance [M]'
+                      : 'Pressure Map Overlay OFF'
+                  );
+                  setTimeout(() => setBeautifyNotice(null), 2500);
+                  return next;
+                });
+              }}
               className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                 showPressureHeatmap
-                  ? 'bg-gradient-to-r from-cyan-500/10 via-amber-500/15 to-rose-500/20 border border-amber-300 text-amber-950 shadow-2xs ring-1 ring-amber-300/60'
+                  ? 'bg-gradient-to-r from-amber-500/15 via-rose-500/15 to-indigo-500/20 border border-amber-400 text-amber-950 shadow-2xs ring-2 ring-amber-400/50'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
               }`}
-              title="Toggle Pressure Intensity Heatmap: Visualizes stylus/downstroke input intensity with chromatic heat gradients [M]"
+              title="Toggle Pressure Map Overlay [M]: Renders stroke data with varying thicknesses, allowing you to visualize and balance pen pressure across handwritten glyphs"
             >
               <Flame className={`w-3.5 h-3.5 ${showPressureHeatmap ? 'text-amber-600 animate-pulse' : 'text-slate-400'}`} />
-              <span>Heatmap {showPressureHeatmap ? 'ON' : 'OFF'}</span>
+              <span>Pressure Map {showPressureHeatmap ? 'ON' : 'OFF'} [M]</span>
+              {showPressureHeatmap && currentStrokes.length > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.2 rounded bg-amber-600 text-white text-[10px] font-mono font-bold">
+                  {penmanshipMetrics.consistencyScore}%
+                </span>
+              )}
             </button>
 
             <button
@@ -1905,37 +2918,42 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <span>Tracing Guide {tracingGuide.enabled ? 'ON' : 'OFF'}</span>
             </button>
 
-            {/* Tracing Underlay Reference Image Button */}
+            {/* Background Reference Image Tracing Import & Toggle */}
             {!underlay.src ? (
-              <button
-                onClick={() => setShowUnderlayPanel((prev) => !prev)}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                  showUnderlayPanel
-                    ? 'bg-indigo-50 border border-indigo-300 text-indigo-900 shadow-2xs font-semibold'
-                    : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
-                }`}
-                title="Add or configure an underlay reference image to trace over [U]"
-              >
-                <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
-                <span>Trace Underlay</span>
-              </button>
+              <div className="flex items-center rounded-lg border border-indigo-200 bg-indigo-50/70 overflow-hidden shadow-2xs">
+                <button
+                  onClick={() => underlayInputRef.current?.click()}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-indigo-900 hover:bg-indigo-100 transition-colors"
+                  title="Import reference image (sketch, calligraphy, or photo) to trace over for complex character shapes [U]"
+                >
+                  <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
+                  <span>Import Reference Image</span>
+                </button>
+                <button
+                  onClick={() => setShowUnderlayPanel((prev) => !prev)}
+                  className="px-1.5 py-1.5 text-xs transition-colors border-l border-indigo-200 text-indigo-700 hover:bg-indigo-100"
+                  title="Open Tracing Reference inspector and sample presets"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                </button>
+              </div>
             ) : (
-              <div className="flex items-center rounded-lg border border-indigo-200 overflow-hidden shadow-2xs">
+              <div className="flex items-center rounded-lg border border-indigo-200 overflow-hidden shadow-2xs bg-white">
                 <button
                   onClick={() => setUnderlay((prev) => ({ ...prev, visible: !prev.visible }))}
-                  className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold transition-colors ${
                     underlay.visible
-                      ? 'bg-indigo-600 text-white font-semibold'
+                      ? 'bg-indigo-600 text-white'
                       : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
                   }`}
-                  title="Toggle Underlay Image on/off [U]"
+                  title="Toggle Reference Underlay Image on/off [U]"
                 >
                   {underlay.visible ? (
                     <Eye className="w-3.5 h-3.5" />
                   ) : (
                     <EyeOff className="w-3.5 h-3.5" />
                   )}
-                  <span>Underlay {underlay.visible ? 'ON' : 'OFF'}</span>
+                  <span>Reference {underlay.visible ? 'ON' : 'OFF'}</span>
                 </button>
                 <button
                   onClick={() => setShowUnderlayPanel((prev) => !prev)}
@@ -1944,7 +2962,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                       ? 'bg-indigo-700 text-white'
                       : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
                   }`}
-                  title="Adjust Underlay Settings (scale, opacity, offset, high contrast)"
+                  title="Adjust Reference Image Tracing settings (scale, opacity, offset, contrast)"
                 >
                   <Sliders className="w-3.5 h-3.5" />
                 </button>
@@ -2044,6 +3062,35 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <span>Center Glyph</span>
             </button>
 
+            {/* Copy Glyph / Base Shapes Tool */}
+            <div className="flex items-center rounded-md border border-indigo-200 overflow-hidden bg-white shadow-2xs">
+              <button
+                onClick={() => setIsCopyGlyphModalOpen(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-indigo-900 hover:bg-indigo-50 transition-colors cursor-pointer"
+                title="Copy Glyph: Copy stroke data between characters to craft stylistic variants or borrow base shapes [Alt+C]"
+              >
+                <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Copy Glyph</span>
+              </button>
+              {glyphClipboard && (
+                <button
+                  onClick={() => {
+                    handleApplyCopyStrokes(
+                      glyphClipboard.char,
+                      currentChar,
+                      'replace',
+                      true
+                    );
+                  }}
+                  className="px-2 py-1.5 text-[11px] font-bold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border-l border-indigo-200 transition-colors flex items-center gap-1 cursor-pointer"
+                  title={`Quick Paste ${glyphClipboard.strokes.length} strokes from '${glyphClipboard.char}' into '${currentChar}' [Ctrl+Shift+V]`}
+                >
+                  <ClipboardCheck className="w-3 h-3 text-emerald-600" />
+                  <span>Paste '{glyphClipboard.char}'</span>
+                </button>
+              )}
+            </div>
+
             {/* Mirror / Flip Tools */}
             <div className="flex items-center rounded-md border border-slate-200 overflow-hidden bg-white shadow-2xs">
               <button
@@ -2064,6 +3111,46 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               >
                 <FlipVertical className="w-3.5 h-3.5 text-indigo-600" />
                 <span className="hidden md:inline">Mirror V</span>
+              </button>
+            </div>
+
+            {/* Symmetry Guide Mirroring Tool */}
+            <div className="flex items-center rounded-md border border-slate-200 overflow-hidden bg-white shadow-2xs">
+              <button
+                onClick={() => {
+                  setSymmetryEnabled((prev) => {
+                    const next = !prev;
+                    setBeautifyNotice(
+                      next
+                        ? `Symmetry Guide ON: horizontal mirroring active at X=${effectiveSymmetryAxisX}px [S]`
+                        : 'Symmetry Guide OFF'
+                    );
+                    setTimeout(() => setBeautifyNotice(null), 2500);
+                    return next;
+                  });
+                }}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold transition-all ${
+                  symmetryEnabled
+                    ? 'bg-indigo-600 text-white shadow-2xs'
+                    : 'text-slate-700 hover:bg-slate-50'
+                }`}
+                title="Toggle Symmetry Guide [S]: Mirror strokes horizontally across center axis to assist drawing symmetrical characters like 'O' or 'A'"
+              >
+                <Split className={`w-3.5 h-3.5 ${symmetryEnabled ? 'text-white' : 'text-indigo-600'}`} />
+                <span>Symmetry {symmetryEnabled ? 'ON' : 'OFF'} [S]</span>
+              </button>
+              <button
+                onClick={() => setShowSymmetryPanel((prev) => !prev)}
+                className={`px-1.5 py-1.5 text-xs transition-colors border-l ${
+                  showSymmetryPanel
+                    ? 'bg-indigo-800 text-white border-indigo-700'
+                    : symmetryEnabled
+                    ? 'bg-indigo-700 text-indigo-100 hover:bg-indigo-800 border-indigo-500'
+                    : 'text-slate-500 hover:bg-slate-100 border-slate-200'
+                }`}
+                title="Symmetry Guide Settings: Change axis mode (Metric vs Canvas), adjust offset, or use one-click Left/Right mirroring"
+              >
+                <Sliders className="w-3.5 h-3.5" />
               </button>
             </div>
 
@@ -2166,6 +3253,17 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
           />
         )}
 
+        {/* Typographic Horizontal Baseline & Cap-Height Guide Inspector Panel */}
+        {showGuideConfigPanel && (
+          <BaselineGuideInspector
+            config={guideConfig}
+            onChange={setGuideConfig}
+            onSnapToBaseline={handleSnapToConfiguredBaseline}
+            onClose={() => setShowGuideConfigPanel(false)}
+            currentChar={currentChar}
+          />
+        )}
+
         {/* Glyph Alternates & Contextual Variants Bar */}
         <div className="bg-slate-50/90 border-b border-slate-200 px-6 py-2 flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2 overflow-x-auto no-scrollbar py-0.5">
@@ -2251,6 +3349,15 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               </button>
             )}
 
+            <button
+              onClick={() => setIsCopyGlyphModalOpen(true)}
+              className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-indigo-700 bg-white border border-indigo-200/90 rounded-md hover:bg-indigo-50 transition-colors shrink-0"
+              title="Borrow stroke data from another character to build a new stylistic variant or base shape"
+            >
+              <Copy className="w-3 h-3 text-indigo-600" />
+              <span>Copy Base Shape</span>
+            </button>
+
             {/* Automated Contextual Alternates Generator Button */}
             <button
               onClick={() => setIsContextualModalOpen(true)}
@@ -2283,11 +3390,18 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         </div>
 
         {/* Main Canvas Viewport */}
-        <div className="flex-1 flex flex-col items-center justify-center p-4 lg:p-6 overflow-hidden relative">
+        <div className="flex-1 flex flex-col items-center justify-center p-2 sm:p-4 lg:p-6 overflow-hidden relative">
           <div
             onDragOver={(e) => {
               e.preventDefault();
               setIsDragOverCanvas(true);
+              const rect = e.currentTarget.getBoundingClientRect();
+              const relativeY = e.clientY - rect.top;
+              if (relativeY < rect.height / 2) {
+                setCanvasDropTarget('underlay');
+              } else {
+                setCanvasDropTarget('crop');
+              }
             }}
             onDragLeave={(e) => {
               e.preventDefault();
@@ -2295,8 +3409,8 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             }}
             onDrop={handleCanvasDrop}
             className={`relative shadow-2xl rounded-xl overflow-hidden border ${
-              isDragOverCanvas ? 'border-emerald-500 ring-4 ring-emerald-200' : 'border-slate-300'
-            } bg-white max-w-[620px] max-h-[620px] w-full aspect-square touch-none transition-all`}
+              isDragOverCanvas ? 'border-indigo-500 ring-4 ring-indigo-200' : 'border-slate-300'
+            } bg-white max-w-[min(calc(100vw-20px),620px)] max-h-[min(calc(100vw-20px),620px)] w-full aspect-square touch-none transition-all`}
           >
             <canvas
               ref={canvasRef}
@@ -2310,51 +3424,602 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               style={{ touchAction: 'none' }}
             />
 
-            {/* Floating Pressure Intensity Heatmap HUD Card */}
+            {/* Floating Pressure Map (Thickness & Penmanship Balance) HUD Card */}
             {showPressureHeatmap && (
-              <div className="absolute top-2.5 left-2.5 z-20 bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-xl p-3 text-white shadow-xl max-w-[270px] animate-in fade-in slide-in-from-top-1 duration-200 select-none">
-                <div className="flex items-center justify-between gap-2 mb-2">
+              <div
+                className={`absolute top-2.5 left-2.5 z-20 bg-slate-900/95 backdrop-blur-md border border-amber-500/40 rounded-xl ${
+                  isPressureHUDCollapsed ? 'py-1.5 px-3 max-w-fit' : 'p-3 max-w-[335px]'
+                } text-white shadow-xl w-full animate-in fade-in slide-in-from-top-1 duration-200 select-none`}
+              >
+                {/* Header */}
+                <div
+                  className={`flex items-center justify-between gap-2 ${
+                    isPressureHUDCollapsed ? '' : 'mb-2 pb-1.5 border-b border-slate-800'
+                  }`}
+                >
                   <div className="flex items-center gap-1.5 text-xs font-bold text-amber-300">
-                    <Flame className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Pressure Intensity</span>
+                    <Flame className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+                    <span>
+                      {isPressureHUDCollapsed
+                        ? `Pressure Map: ${penmanshipMetrics.consistencyScore}% (${penmanshipMetrics.consistencyRating.split(' ')[0]})`
+                        : 'Pressure Map · Thickness & Balance'}
+                    </span>
                   </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setIsPressureHUDCollapsed((prev) => !prev)}
+                      className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 text-[10px]"
+                      title={isPressureHUDCollapsed ? 'Expand Pressure Map & Balance details' : 'Collapse HUD'}
+                    >
+                      <Sliders className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={() => setShowPressureHeatmap(false)}
+                      className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
+                      title="Hide Pressure Map Overlay [M]"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+
+                {!isPressureHUDCollapsed && (
+                  <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
+                    {/* Penmanship Consistency Score Card */}
+                    <div className="bg-slate-800/80 rounded-lg p-2 border border-slate-700/70">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[11px] font-semibold text-slate-300">Consistency:</span>
+                        <span
+                          className={`text-[11px] font-bold font-mono px-1.5 py-0.2 rounded border ${
+                            penmanshipMetrics.consistencyScore >= 85
+                              ? 'bg-emerald-950/70 text-emerald-300 border-emerald-500/50'
+                              : penmanshipMetrics.consistencyScore >= 70
+                              ? 'bg-blue-950/70 text-blue-300 border-blue-500/50'
+                              : 'bg-amber-950/70 text-amber-300 border-amber-500/50'
+                          }`}
+                        >
+                          {penmanshipMetrics.consistencyScore}% · {penmanshipMetrics.consistencyRating}
+                        </span>
+                      </div>
+
+                      {/* Consistency Progress Bar */}
+                      <div className="h-2 w-full bg-slate-900 rounded-full overflow-hidden p-0.5 border border-slate-700 mb-1.5">
+                        <div
+                          className={`h-full rounded-full transition-all duration-300 ${
+                            penmanshipMetrics.consistencyScore >= 85
+                              ? 'bg-gradient-to-r from-emerald-500 to-teal-400'
+                              : penmanshipMetrics.consistencyScore >= 70
+                              ? 'bg-gradient-to-r from-blue-500 to-indigo-400'
+                              : 'bg-gradient-to-r from-amber-500 to-rose-400'
+                          }`}
+                          style={{ width: `${penmanshipMetrics.consistencyScore}%` }}
+                        />
+                      </div>
+
+                      {/* Actionable recommendation */}
+                      <p className="text-[10px] text-slate-300 leading-snug italic">
+                        "{penmanshipMetrics.recommendation}"
+                      </p>
+                    </div>
+
+                    {/* Pressure Distribution Spectrum Bar (Hairlines vs Midtones vs Swells) */}
+                    <div>
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono mb-1">
+                        <span>Hairline {penmanshipMetrics.hairlinePercentage}%</span>
+                        <span>Mid {penmanshipMetrics.midPercentage}%</span>
+                        <span>Swell {penmanshipMetrics.swellPercentage}%</span>
+                      </div>
+                      <div className="h-2 w-full rounded-full flex overflow-hidden border border-slate-700 shadow-inner">
+                        <div
+                          className="bg-amber-300 transition-all duration-200"
+                          style={{ width: `${penmanshipMetrics.hairlinePercentage}%` }}
+                          title={`Hairline strokes: ${penmanshipMetrics.hairlinePercentage}%`}
+                        />
+                        <div
+                          className="bg-emerald-400 transition-all duration-200"
+                          style={{ width: `${penmanshipMetrics.midPercentage}%` }}
+                          title={`Mid-tone strokes: ${penmanshipMetrics.midPercentage}%`}
+                        />
+                        <div
+                          className="bg-rose-500 transition-all duration-200"
+                          style={{ width: `${penmanshipMetrics.swellPercentage}%` }}
+                          title={`Heavy swell downstrokes: ${penmanshipMetrics.swellPercentage}%`}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[9px] text-slate-400 font-mono mt-0.5">
+                        <span>Contrast: {penmanshipMetrics.contrastRatio}×</span>
+                        <span>
+                          Tremors:{' '}
+                          {penmanshipMetrics.tremorCount === 0
+                            ? 'Smooth'
+                            : `${penmanshipMetrics.tremorCount} spikes`}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* One-click Balance & Contrast Action Buttons */}
+                    <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] text-slate-300 font-semibold">
+                        <span>Pressure Balance Tools:</span>
+                        <span className="text-[9px] text-slate-400 font-normal">Undoable</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                          onClick={handleBalancePressure}
+                          disabled={currentStrokes.length === 0}
+                          className="flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                          title="Balance pen pressure across all strokes to smooth hand tremors and normalize stem thickness"
+                        >
+                          <Sliders className="w-3 h-3 text-amber-400" />
+                          <span>Balance Pressure</span>
+                        </button>
+                        <button
+                          onClick={handleBoostPressureContrast}
+                          disabled={currentStrokes.length === 0}
+                          className="flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                          title="Boost dynamic calligraphic contrast between hairlines and downstroke swells"
+                        >
+                          <Sparkles className="w-3 h-3 text-indigo-400" />
+                          <span>Boost Contrast</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Color Palette Switcher Pills */}
+                    <div>
+                      <div className="text-[10px] text-slate-400 font-medium mb-1">Color Palette:</div>
+                      <div className="grid grid-cols-2 gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px]">
+                        <button
+                          onClick={() => setPressurePalette('penmanship-spectrum')}
+                          className={`py-0.5 px-1.5 rounded font-medium transition-all ${
+                            pressurePalette === 'penmanship-spectrum'
+                              ? 'bg-amber-600 text-white shadow-xs font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Calligraphic spectrum: Gold (hairline) → Jade (stem) → Sapphire (swell) → Crimson"
+                        >
+                          Penmanship
+                        </button>
+                        <button
+                          onClick={() => setPressurePalette('thermal')}
+                          className={`py-0.5 px-1.5 rounded font-medium transition-all ${
+                            pressurePalette === 'thermal'
+                              ? 'bg-indigo-600 text-white shadow-xs font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Thermal chromatic spectrum (Cyan → Green → Amber → Red)"
+                        >
+                          Thermal
+                        </button>
+                        <button
+                          onClick={() => setPressurePalette('light-to-dark')}
+                          className={`py-0.5 px-1.5 rounded font-medium transition-all ${
+                            pressurePalette === 'light-to-dark'
+                              ? 'bg-indigo-600 text-white shadow-xs font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Light periwinkle to midnight obsidian"
+                        >
+                          Light → Dark
+                        </button>
+                        <button
+                          onClick={() => setPressurePalette('ink-density')}
+                          className={`py-0.5 px-1.5 rounded font-medium transition-all ${
+                            pressurePalette === 'ink-density'
+                              ? 'bg-indigo-600 text-white shadow-xs font-semibold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Sumi ink wash monochrome density"
+                        >
+                          Ink Wash
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Dynamic visual gradient representation bar */}
+                    <div
+                      className={`h-2 rounded-full w-full shadow-inner border border-slate-700/60 ${
+                        pressurePalette === 'penmanship-spectrum'
+                          ? 'bg-gradient-to-r from-[#fef08a] via-[#34d399] via-[#3b82f6] to-[#dc2626]'
+                          : pressurePalette === 'light-to-dark'
+                          ? 'bg-gradient-to-r from-[#e0e7ff] via-[#818cf8] via-[#4338ca] via-[#1e1b4b] to-[#020617]'
+                          : pressurePalette === 'ink-density'
+                          ? 'bg-gradient-to-r from-[#f1f5f9] via-[#94a3b8] via-[#475569] to-[#020617]'
+                          : 'bg-gradient-to-r from-[#06b6d4] via-[#10b981] via-[#f59e0b] to-[#ef4444]'
+                      }`}
+                    />
+
+                    {/* Thickness Exaggeration & Opacity Controls */}
+                    <div className="pt-1.5 border-t border-slate-800 space-y-1.5 text-[10px]">
+                      {/* Thickness scale slider */}
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-slate-400 font-mono">Thickness Scale</span>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="range"
+                            min="0.8"
+                            max="2.5"
+                            step="0.05"
+                            value={pressureThicknessScale}
+                            onChange={(e) => setPressureThicknessScale(parseFloat(e.target.value))}
+                            className="w-16 accent-amber-400 cursor-pointer h-1.5"
+                            title="Scale stroke thickness variation on canvas (0.8x to 2.5x)"
+                          />
+                          <span className="font-mono text-amber-300 font-bold text-[9px] w-9 text-right">
+                            {pressureThicknessScale.toFixed(2)}×
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Opacity slider & diagnostic toggle pills */}
+                      <div className="flex items-center justify-between gap-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-400 font-mono">Opacity</span>
+                          <input
+                            type="range"
+                            min="0.2"
+                            max="1.0"
+                            step="0.05"
+                            value={pressureOverlayAlpha}
+                            onChange={(e) => setPressureOverlayAlpha(parseFloat(e.target.value))}
+                            className="w-14 accent-amber-400 cursor-pointer h-1.5"
+                            title="Adjust overlay opacity"
+                          />
+                          <span className="font-mono text-slate-300 text-[9px] w-6">
+                            {Math.round(pressureOverlayAlpha * 100)}%
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => setShowPressureBadges((prev) => !prev)}
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-medium border transition-colors ${
+                              showPressureBadges
+                                ? 'bg-amber-950/70 border-amber-500/80 text-amber-200'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                            }`}
+                            title="Toggle numeric pressure percentage badges along stroke paths"
+                          >
+                            % Badges
+                          </button>
+                          <button
+                            onClick={() => setShowPressureSwellCalipers((prev) => !prev)}
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-medium border transition-colors ${
+                              showPressureSwellCalipers
+                                ? 'bg-amber-950/70 border-amber-500/80 text-amber-200'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                            }`}
+                            title="Toggle downstroke peak swell caliper markers"
+                          >
+                            Swells
+                          </button>
+                          <button
+                            onClick={() => setShowPressureTremorWarnings((prev) => !prev)}
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-medium border transition-colors ${
+                              showPressureTremorWarnings
+                                ? 'bg-rose-950/70 border-rose-500/80 text-rose-200'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                            }`}
+                            title="Highlight sudden pressure tremor spikes"
+                          >
+                            Tremors
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Live Pressure & Thickness Metrics */}
+                    <div className="grid grid-cols-4 gap-1 pt-1.5 border-t border-slate-800 text-center font-mono">
+                      <div className="bg-slate-800/80 rounded px-1 py-1">
+                        <div className="text-[8px] text-slate-400 uppercase">Min</div>
+                        <div className="text-[10px] font-bold text-amber-200">{pressureStats.min}</div>
+                        <div className="text-[8px] text-slate-400">{pressureStats.minThickness}</div>
+                      </div>
+                      <div className="bg-slate-800/80 rounded px-1 py-1">
+                        <div className="text-[8px] text-slate-400 uppercase">Avg</div>
+                        <div className="text-[10px] font-bold text-amber-400">{pressureStats.avg}</div>
+                        <div className="text-[8px] text-slate-400">{pressureStats.avgThickness}</div>
+                      </div>
+                      <div className="bg-slate-800/80 rounded px-1 py-1">
+                        <div className="text-[8px] text-slate-400 uppercase">Max</div>
+                        <div className="text-[10px] font-bold text-rose-400">{pressureStats.max}</div>
+                        <div className="text-[8px] text-slate-400">{pressureStats.maxThickness}</div>
+                      </div>
+                      <div className="bg-slate-800/80 rounded px-1 py-1">
+                        <div className="text-[8px] text-slate-400 uppercase">Strokes</div>
+                        <div className="text-[10px] font-bold text-slate-300">{currentStrokes.length}</div>
+                        <div className="text-[8px] text-slate-400">{pressureStats.pointCount} pts</div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Floating Symmetry Guide HUD / Inspector on Canvas */}
+            {(symmetryEnabled || showSymmetryPanel) && (
+              <div
+                className={`absolute top-2.5 ${
+                  showPressureHeatmap ? (isPressureHUDCollapsed ? 'left-[215px]' : 'left-[340px]') : 'left-2.5'
+                } z-20 bg-slate-900/95 backdrop-blur-md border border-indigo-500/50 rounded-xl ${
+                  showSymmetryPanel ? 'p-3 max-w-[310px]' : 'py-1.5 px-3 max-w-fit'
+                } text-white shadow-xl w-full animate-in fade-in slide-in-from-top-1 duration-200 select-none`}
+              >
+                {/* Header Row */}
+                <div className={`flex items-center justify-between gap-2.5 ${showSymmetryPanel ? 'mb-2 pb-1.5 border-b border-slate-800' : ''}`}>
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-300">
+                    <Split className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Symmetry {showSymmetryPanel ? 'Guide · Mirror H' : `X: ${effectiveSymmetryAxisX}px`}</span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setSymmetryEnabled((prev) => !prev)}
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded transition-colors ${
+                        symmetryEnabled
+                          ? 'bg-indigo-600 text-white shadow-2xs'
+                          : 'bg-slate-800 text-slate-300 hover:text-white'
+                      }`}
+                      title="Toggle real-time stroke mirroring across center axis [S]"
+                    >
+                      {symmetryEnabled ? 'Active [S]' : 'Off [S]'}
+                    </button>
+                    <button
+                      onClick={() => setShowSymmetryPanel((prev) => !prev)}
+                      className={`p-1 rounded text-xs transition-colors ${
+                        showSymmetryPanel
+                          ? 'bg-indigo-700 text-white'
+                          : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      title={showSymmetryPanel ? 'Collapse Symmetry Panel' : 'Expand Symmetry Settings'}
+                    >
+                      <Sliders className="w-3 h-3" />
+                    </button>
+                    {showSymmetryPanel && (
+                      <button
+                        onClick={() => setShowSymmetryPanel(false)}
+                        className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
+                        title="Close Symmetry Inspector"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Expanded Symmetry Inspector Controls */}
+                {showSymmetryPanel && (
+                  <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
+                    {/* Axis Center Info */}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-400 text-[11px]">Axis Center:</span>
+                      <span className="font-mono text-indigo-200 font-bold bg-slate-800/90 px-2 py-0.5 rounded border border-slate-700/80 text-[11px]">
+                        X: {effectiveSymmetryAxisX}px
+                      </span>
+                    </div>
+
+                    {/* Mode Selector: Metric Center vs Canvas Center */}
+                    <div className="flex items-center gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px]">
+                      <button
+                        onClick={() => setSymmetryAxisMode('metric')}
+                        className={`flex-1 py-1 px-1.5 rounded font-medium transition-all ${
+                          symmetryAxisMode === 'metric'
+                            ? 'bg-indigo-600 text-white shadow-xs font-semibold'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                        title="Metric Center: Centers axis between character left and right side bearings"
+                      >
+                        Glyph Center ({Math.round(CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36)}px)
+                      </button>
+                      <button
+                        onClick={() => setSymmetryAxisMode('canvas')}
+                        className={`flex-1 py-1 px-1.5 rounded font-medium transition-all ${
+                          symmetryAxisMode === 'canvas'
+                            ? 'bg-indigo-600 text-white shadow-xs font-semibold'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                        title="Canvas Center: Uses geometric 400px center of canvas"
+                      >
+                        Canvas 400px
+                      </button>
+                    </div>
+
+                    {/* Axis Nudge Offset */}
+                    <div className="flex items-center justify-between gap-1.5 bg-slate-800/60 px-2 py-1.5 rounded-lg border border-slate-700/60 text-[11px]">
+                      <span className="text-slate-400">Axis Nudge:</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => setSymmetryAxisOffset((prev) => prev - 2)}
+                          className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[10px]"
+                          title="Nudge axis 2px left"
+                        >
+                          -2px
+                        </button>
+                        <span className="font-mono text-slate-300 w-9 text-center text-[10px]">
+                          {symmetryAxisOffset > 0 ? `+${symmetryAxisOffset}` : symmetryAxisOffset}px
+                        </span>
+                        <button
+                          onClick={() => setSymmetryAxisOffset((prev) => prev + 2)}
+                          className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[10px]"
+                          title="Nudge axis 2px right"
+                        >
+                          +2px
+                        </button>
+                        {symmetryAxisOffset !== 0 && (
+                          <button
+                            onClick={() => setSymmetryAxisOffset(0)}
+                            className="text-[10px] text-indigo-400 hover:text-indigo-300 underline ml-1"
+                            title="Reset axis offset to 0"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* One-Click Half-Stroke Mirroring */}
+                    <div className="pt-2 border-t border-slate-800">
+                      <div className="text-[10px] text-slate-400 mb-1.5 font-medium">
+                        One-Click Half Mirror (Draw half, then mirror):
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                          onClick={() => handleMirrorSide('left')}
+                          disabled={currentStrokes.length === 0}
+                          className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 text-[10px] font-semibold border border-slate-700 transition-colors"
+                          title="Duplicate and mirror left half to right side"
+                        >
+                          <span>Left ➔ Right</span>
+                        </button>
+                        <button
+                          onClick={() => handleMirrorSide('right')}
+                          disabled={currentStrokes.length === 0}
+                          className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 text-[10px] font-semibold border border-slate-700 transition-colors"
+                          title="Duplicate and mirror right half to left side"
+                        >
+                          <span>Right ➔ Left</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Symmetrical Character Quick Select */}
+                    <div className="pt-2 border-t border-slate-800">
+                      <div className="text-[10px] text-slate-400 mb-1.5 font-medium flex items-center justify-between">
+                        <span>Symmetrical Letters:</span>
+                        <span className="text-[9px] text-indigo-300">e.g. O, A, M, H</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {SYMMETRY_PRESET_CHARS.map((char) => (
+                          <button
+                            key={char}
+                            onClick={() => onSelectChar(char)}
+                            className={`w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold font-mono transition-colors ${
+                              currentChar === char
+                                ? 'bg-indigo-600 text-white ring-1 ring-white'
+                                : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
+                            }`}
+                            title={`Switch to symmetrical character '${char}'`}
+                          >
+                            {char}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Floating Background Reference Image Tracing HUD Card on Canvas */}
+            {underlay.src && (
+              <div
+                className={`absolute ${
+                  tracingGuide.enabled ? 'top-12' : 'top-2.5'
+                } right-2.5 z-20 flex items-center gap-2 bg-slate-900/90 backdrop-blur-md border border-indigo-400/50 text-white rounded-xl px-2.5 py-1.5 shadow-xl text-xs select-none animate-in fade-in duration-150`}
+              >
+                <div className="flex items-center gap-1.5 font-semibold text-indigo-300">
+                  <ImageIcon className="w-3.5 h-3.5 text-indigo-400" />
+                  <span className="hidden sm:inline">Reference</span>
+                </div>
+
+                {/* Visibility Eye */}
+                <button
+                  onClick={() => setUnderlay((prev) => ({ ...prev, visible: !prev.visible }))}
+                  className={`p-1 rounded transition-colors ${
+                    underlay.visible
+                      ? 'bg-indigo-600/80 text-white hover:bg-indigo-600'
+                      : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                  title="Toggle Reference Underlay [U]"
+                >
+                  {underlay.visible ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                </button>
+
+                {/* Quick Opacity Slider */}
+                <div className="flex items-center gap-1 px-1.5 py-0.5 bg-slate-800/80 rounded border border-slate-700">
+                  <span className="text-[10px] text-slate-400 font-mono">Opacity</span>
+                  <input
+                    type="range"
+                    min="0.1"
+                    max="1"
+                    step="0.05"
+                    value={underlay.opacity}
+                    onChange={(e) =>
+                      setUnderlay((prev) => ({ ...prev, opacity: parseFloat(e.target.value) }))
+                    }
+                    className="w-12 accent-indigo-400 cursor-pointer"
+                    title="Adjust Reference Image Opacity"
+                  />
+                  <span className="text-[10px] font-mono text-indigo-200 tabular-nums">
+                    {Math.round(underlay.opacity * 100)}%
+                  </span>
+                </div>
+
+                {/* Scale Nudges */}
+                <div className="flex items-center gap-0.5">
                   <button
-                    onClick={() => setShowPressureHeatmap(false)}
-                    className="text-slate-400 hover:text-white text-xs font-bold px-1"
-                    title="Close Heatmap Layer"
+                    onClick={() =>
+                      setUnderlay((prev) => ({ ...prev, scale: Math.max(0.3, prev.scale - 0.1) }))
+                    }
+                    className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold"
+                    title="Zoom Out Reference"
                   >
-                    ×
+                    -
+                  </button>
+                  <span className="text-[10px] font-mono text-slate-300 tabular-nums px-0.5">
+                    {underlay.scale.toFixed(1)}x
+                  </span>
+                  <button
+                    onClick={() =>
+                      setUnderlay((prev) => ({ ...prev, scale: Math.min(2.5, prev.scale + 0.1) }))
+                    }
+                    className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold"
+                    title="Zoom In Reference"
+                  >
+                    +
                   </button>
                 </div>
 
-                {/* Chromatic spectrum gradient bar */}
-                <div className="h-2 rounded-full w-full bg-gradient-to-r from-[#06b6d4] via-[#10b981] via-[#f59e0b] to-[#ef4444] shadow-inner mb-1.5" />
-                <div className="flex items-center justify-between text-[9px] text-slate-300 font-mono mb-2">
-                  <span className="text-cyan-300">&lt;0.35 Light</span>
-                  <span className="text-emerald-300">0.50 Steady</span>
-                  <span className="text-amber-300">0.90 Firm</span>
-                  <span className="text-rose-300">&gt;1.05 Swell</span>
-                </div>
+                {/* High Contrast B&W Toggle */}
+                <button
+                  onClick={() => setUnderlay((prev) => ({ ...prev, grayscale: !prev.grayscale }))}
+                  className={`px-1.5 py-0.5 text-[10px] font-bold rounded transition-colors ${
+                    underlay.grayscale
+                      ? 'bg-indigo-700 text-white'
+                      : 'bg-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                  title="Toggle B&W High-Contrast Tracing Filter"
+                >
+                  B&W
+                </button>
 
-                {/* Live Stroke Pressure Metrics */}
-                <div className="grid grid-cols-4 gap-1.5 pt-2 border-t border-slate-800 text-center font-mono">
-                  <div className="bg-slate-800/80 rounded px-1 py-1">
-                    <div className="text-[9px] text-slate-400 uppercase">Min</div>
-                    <div className="text-[11px] font-bold text-cyan-300">{pressureStats.min}</div>
-                  </div>
-                  <div className="bg-slate-800/80 rounded px-1 py-1">
-                    <div className="text-[9px] text-slate-400 uppercase">Avg</div>
-                    <div className="text-[11px] font-bold text-emerald-300">{pressureStats.avg}</div>
-                  </div>
-                  <div className="bg-slate-800/80 rounded px-1 py-1">
-                    <div className="text-[9px] text-slate-400 uppercase">Max</div>
-                    <div className="text-[11px] font-bold text-rose-300">{pressureStats.max}</div>
-                  </div>
-                  <div className="bg-slate-800/80 rounded px-1 py-1">
-                    <div className="text-[9px] text-slate-400 uppercase">Pts</div>
-                    <div className="text-[11px] font-bold text-amber-300">{pressureStats.pointCount}</div>
-                  </div>
-                </div>
+                {/* Open full settings */}
+                <button
+                  onClick={() => setShowUnderlayPanel((prev) => !prev)}
+                  className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                  title="Open Reference Inspector Panel"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Clear Reference */}
+                <button
+                  onClick={() =>
+                    setUnderlay({
+                      src: null,
+                      visible: true,
+                      opacity: 0.45,
+                      scale: 1.0,
+                      offsetX: 0,
+                      offsetY: 0,
+                      grayscale: true,
+                      invert: false,
+                    })
+                  }
+                  className="p-1 rounded text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition-colors"
+                  title="Clear Reference Image"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
               </div>
             )}
 
@@ -2383,18 +4048,51 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               </div>
             )}
 
-            {/* Drag & Drop Photo Overlay */}
+            {/* Drag & Drop Photo Overlay with dual targets */}
             {isDragOverCanvas && (
-              <div className="absolute inset-0 z-30 bg-emerald-50/95 border-2 border-dashed border-emerald-500 rounded-xl flex flex-col items-center justify-center p-6 text-center backdrop-blur-2xs pointer-events-none">
-                <div className="w-14 h-14 rounded-full bg-emerald-100 flex items-center justify-center mb-3 text-emerald-600 shadow-sm">
-                  <Upload className="w-7 h-7" />
+              <div className="absolute inset-0 z-30 bg-slate-900/85 backdrop-blur-xs rounded-xl flex flex-col p-4 text-white pointer-events-none select-none">
+                <div className="text-center font-bold text-sm mb-2 text-slate-100">
+                  Drop Image onto Canvas
                 </div>
-                <p className="text-base font-bold text-emerald-950 font-['Plus_Jakarta_Sans']">
-                  Drop Photo Here
-                </p>
-                <p className="text-xs text-emerald-700 mt-1 max-w-xs">
-                  We'll open the character crop tool so you can trace '{currentChar}' into vector ink
-                </p>
+                <div className="flex-1 grid grid-rows-2 gap-2.5">
+                  {/* Top Target: Tracing Underlay */}
+                  <div
+                    className={`flex flex-col items-center justify-center p-3 rounded-xl border-2 transition-all ${
+                      canvasDropTarget === 'underlay'
+                        ? 'bg-indigo-600/90 border-indigo-300 ring-4 ring-indigo-400/50 scale-[1.01]'
+                        : 'bg-slate-800/80 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <ImageIcon className="w-5 h-5 text-indigo-300" />
+                      <span className="font-bold text-xs text-white">
+                        Drop Here: Background Tracing Reference
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-indigo-100 text-center max-w-sm">
+                      Import as underlay to trace over intricate characters, Kanji, or calligraphy sketches
+                    </span>
+                  </div>
+
+                  {/* Bottom Target: Crop & Vectorize */}
+                  <div
+                    className={`flex flex-col items-center justify-center p-3 rounded-xl border-2 transition-all ${
+                      canvasDropTarget === 'crop'
+                        ? 'bg-emerald-600/90 border-emerald-300 ring-4 ring-emerald-400/50 scale-[1.01]'
+                        : 'bg-slate-800/80 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <Camera className="w-5 h-5 text-emerald-300" />
+                      <span className="font-bold text-xs text-white">
+                        Drop Here: Auto-Crop & Vectorize
+                      </span>
+                    </div>
+                    <span className="text-[11px] text-emerald-100 text-center max-w-sm">
+                      Extract and vectorize letter '{currentChar}' directly into black ink paths
+                    </span>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -2437,26 +4135,165 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               </div>
             )}
 
+            {/* Floating Calligraphy Fountain Pen Nib Status Badge on Canvas */}
+            {drawingMode === 'pen' && penSettings.tool === 'calligraphy' && (
+              <div className="absolute bottom-2.5 right-2.5 z-20 flex items-center gap-1.5 bg-amber-950/90 backdrop-blur-md border border-amber-500/50 text-amber-100 rounded-lg py-1 px-2.5 text-[11px] shadow-lg select-none">
+                <div
+                  className="w-4 h-4 rounded-full bg-amber-800/80 border border-amber-400 flex items-center justify-center relative shrink-0"
+                  title={`Calligraphy Chisel Nib at ${penSettings.angle ?? 45}°`}
+                >
+                  <div
+                    className="w-2.5 h-[2px] bg-amber-200 rounded-full"
+                    style={{ transform: `rotate(${-((penSettings.angle ?? 45))}deg)` }}
+                  />
+                </div>
+                <span className="font-semibold text-amber-200">
+                  Calligraphy: {penSettings.angle ?? 45}°
+                </span>
+                <span className="text-amber-400/60">·</span>
+                <span className="text-[10px] text-amber-300 font-mono hidden sm:inline">
+                  Directional Swell
+                </span>
+              </div>
+            )}
+
             {/* Canvas Guideline Labels */}
             {showGuides && (
-              <div className="absolute left-2.5 top-0 bottom-0 pointer-events-none flex flex-col justify-between py-2 text-[10px] font-mono text-slate-400 select-none">
-                <span style={{ top: '20%' }} className="absolute">
+              <div className="absolute left-2 top-0 bottom-0 pointer-events-none flex flex-col py-2 text-[10px] font-mono text-slate-400 select-none">
+                <span
+                  style={{ top: `${(CANVAS_ASCENDER / CANVAS_SIZE) * 100}%`, transform: 'translateY(-50%)' }}
+                  className="absolute text-blue-400/90 font-medium"
+                >
                   Ascender
                 </span>
-                <span style={{ top: '30%' }} className="absolute">
-                  Cap
-                </span>
-                <span style={{ top: '50%' }} className="absolute">
+                <div
+                  style={{ top: `${(guideConfig.capHeight / CANVAS_SIZE) * 100}%`, transform: 'translateY(-50%)' }}
+                  className="absolute pointer-events-auto flex items-center gap-1 group bg-white/80 backdrop-blur-2xs px-1 rounded border border-blue-200/60 shadow-2xs"
+                >
+                  <span className="font-semibold text-blue-600">Cap</span>
+                  <span className="text-[9px] text-blue-500 font-mono hidden sm:inline">{guideConfig.capHeight}px</span>
+                  <div className="opacity-0 group-hover:opacity-100 flex items-center transition-opacity ml-0.5">
+                    <button
+                      onClick={() => setGuideConfig((prev) => ({ ...prev, capHeight: Math.max(100, prev.capHeight - 5) }))}
+                      className="px-0.5 text-blue-600 hover:text-blue-900 font-bold leading-none"
+                      title="Nudge Cap Height Up (-5px)"
+                    >
+                      ▲
+                    </button>
+                    <button
+                      onClick={() => setGuideConfig((prev) => ({ ...prev, capHeight: Math.min(prev.baseline - 50, prev.capHeight + 5) }))}
+                      className="px-0.5 text-blue-600 hover:text-blue-900 font-bold leading-none"
+                      title="Nudge Cap Height Down (+5px)"
+                    >
+                      ▼
+                    </button>
+                  </div>
+                </div>
+                <span
+                  style={{
+                    top: `${(((guideConfig.baseline - (guideConfig.baseline - guideConfig.capHeight) * 0.62)) / CANVAS_SIZE) * 100}%`,
+                    transform: 'translateY(-50%)',
+                  }}
+                  className="absolute text-amber-500/90 font-medium"
+                >
                   x-Height
                 </span>
-                <span style={{ top: '75%' }} className="absolute text-rose-500 font-semibold">
-                  Baseline
-                </span>
-                <span style={{ top: '95%' }} className="absolute">
+                <div
+                  style={{ top: `${(guideConfig.baseline / CANVAS_SIZE) * 100}%`, transform: 'translateY(-50%)' }}
+                  className="absolute pointer-events-auto flex items-center gap-1 group bg-white/80 backdrop-blur-2xs px-1 rounded border border-rose-200/60 shadow-2xs"
+                >
+                  <span className="font-bold text-rose-600">Baseline</span>
+                  <span className="text-[9px] text-rose-500 font-mono hidden sm:inline">{guideConfig.baseline}px</span>
+                  <div className="opacity-0 group-hover:opacity-100 flex items-center transition-opacity ml-0.5">
+                    <button
+                      onClick={() => setGuideConfig((prev) => ({ ...prev, baseline: Math.max(prev.capHeight + 50, prev.baseline - 5) }))}
+                      className="px-0.5 text-rose-600 hover:text-rose-900 font-bold leading-none"
+                      title="Nudge Baseline Up (-5px)"
+                    >
+                      ▲
+                    </button>
+                    <button
+                      onClick={() => setGuideConfig((prev) => ({ ...prev, baseline: Math.min(760, prev.baseline + 5) }))}
+                      className="px-0.5 text-rose-600 hover:text-rose-900 font-bold leading-none"
+                      title="Nudge Baseline Down (+5px)"
+                    >
+                      ▼
+                    </button>
+                  </div>
+                </div>
+                <span
+                  style={{ top: `${(CANVAS_DESCENDER / CANVAS_SIZE) * 100}%`, transform: 'translateY(-50%)' }}
+                  className="absolute text-purple-400/90 font-medium"
+                >
                   Descender
                 </span>
               </div>
             )}
+          </div>
+
+          {/* Mobile Canvas Quick Action Dock (Visible on screens < lg) */}
+          <div className="lg:hidden mt-2.5 w-full max-w-[min(calc(100vw-20px),620px)] bg-white border border-slate-200/90 rounded-xl p-1.5 shadow-sm flex items-center justify-between gap-1 select-none">
+            <button
+              onClick={goToPrev}
+              disabled={currentIndex === 0}
+              className="flex items-center justify-center p-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-slate-700 min-h-[40px] min-w-[40px]"
+              title="Previous character"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={handleUndo}
+              disabled={undoStack.length === 0 && currentStrokes.length === 0}
+              className="flex-1 flex items-center justify-center gap-1 py-2 px-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 disabled:opacity-30 text-slate-700 text-xs font-semibold min-h-[40px]"
+              title="Undo last stroke"
+            >
+              <Undo className="w-3.5 h-3.5" />
+              <span>Undo</span>
+              {undoStack.length > 0 && (
+                <span className="text-[10px] font-mono text-slate-500 font-bold ml-0.5">
+                  {undoStack.length}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={handleRedo}
+              disabled={redoStack.length === 0}
+              className="flex-1 flex items-center justify-center gap-1 py-2 px-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 disabled:opacity-30 text-slate-700 text-xs font-semibold min-h-[40px]"
+              title="Redo stroke"
+            >
+              <Redo className="w-3.5 h-3.5" />
+              <span>Redo</span>
+            </button>
+
+            <button
+              onClick={handleBeautifyCurrent}
+              disabled={currentStrokes.length === 0}
+              className="flex-1 flex items-center justify-center gap-1 py-2 px-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 border border-amber-200 disabled:opacity-30 text-amber-900 text-xs font-semibold min-h-[40px]"
+              title="Smooth curves and reduce hand jitter"
+            >
+              <Wand2 className="w-3.5 h-3.5 text-amber-600" />
+              <span>Smooth</span>
+            </button>
+
+            <button
+              onClick={handleClear}
+              disabled={currentStrokes.length === 0}
+              className="flex items-center justify-center p-2 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 disabled:opacity-30 text-rose-600 min-h-[40px] min-w-[40px]"
+              title="Clear ink"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={goToNext}
+              disabled={currentIndex === allChars.length - 1}
+              className="flex items-center justify-center p-2 rounded-lg bg-slate-100 hover:bg-slate-200 disabled:opacity-30 text-slate-700 min-h-[40px] min-w-[40px]"
+              title="Next character"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
           </div>
 
           {/* Quick Photo Upload & Helper Bar beneath canvas */}
@@ -2487,19 +4324,36 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
           </div>
         </div>
 
-        {/* Bottom Inspector Bar */}
-        <div className="bg-white border-t border-slate-200 px-6 py-2.5 flex items-center justify-between text-xs text-slate-600 flex-wrap gap-4">
+        {/* Bottom Inspector Bar (Desktop only) */}
+        <div className="hidden lg:flex bg-white border-t border-slate-200 px-6 py-2.5 items-center justify-between text-xs text-slate-600 flex-wrap gap-4">
           <div className="flex items-center gap-5">
             {/* Guide toggles */}
-            <label className="flex items-center gap-1.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={showGuides}
-                onChange={(e) => setShowGuides(e.target.checked)}
-                className="rounded border-slate-300 text-slate-900 focus:ring-0"
-              />
-              <span>Typographic Guides</span>
-            </label>
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={showGuides}
+                  onChange={(e) => setShowGuides(e.target.checked)}
+                  className="rounded border-slate-300 text-slate-900 focus:ring-0"
+                />
+                <span className="font-medium">Typographic Guides</span>
+              </label>
+
+              {showGuides && (
+                <button
+                  onClick={() => setShowGuideConfigPanel((prev) => !prev)}
+                  className={`flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold border transition-all ${
+                    showGuideConfigPanel
+                      ? 'bg-blue-600 text-white border-blue-600 shadow-2xs'
+                      : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100'
+                  }`}
+                  title="Configure horizontal Baseline, Cap-Height, and optical overshoots"
+                >
+                  <Sliders className="w-3 h-3" />
+                  <span>Configure Guides ({guideConfig.baseline - guideConfig.capHeight}px Cap)</span>
+                </button>
+              )}
+            </div>
 
             <label className="flex items-center gap-1.5 cursor-pointer select-none">
               <input
@@ -2521,7 +4375,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               />
               <span className="flex items-center gap-1">
                 <Gauge className="w-3.5 h-3.5 text-indigo-500" />
-                Width Variation Indicators
+                Width Variation
               </span>
             </label>
 
@@ -2549,26 +4403,84 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               />
               <span className="flex items-center gap-1">
                 <Crosshair className="w-3.5 h-3.5 text-emerald-500" />
-                Bounding Box & Center
+                Bounding Box
               </span>
             </label>
 
-            {/* Pressure Intensity Heatmap Toggle */}
-            <label className="flex items-center gap-1.5 cursor-pointer select-none text-amber-800 font-medium">
+            {/* Pressure Heatmap / Penmanship Consistency Toggle */}
+            <label className="flex items-center gap-1.5 cursor-pointer select-none text-amber-900 font-medium">
               <input
                 type="checkbox"
                 checked={showPressureHeatmap}
-                onChange={(e) => setShowPressureHeatmap(e.target.checked)}
+                onChange={(e) => {
+                  setShowPressureHeatmap(e.target.checked);
+                  if (e.target.checked) {
+                    setBeautifyNotice(
+                      'Pressure Heatmap Overlay ON: Visualizing stroke pressure data for penmanship consistency [M]'
+                    );
+                    setTimeout(() => setBeautifyNotice(null), 2500);
+                  }
+                }}
                 className="rounded border-amber-300 text-amber-600 focus:ring-0"
               />
-              <span className="flex items-center gap-1">
-                <Flame className="w-3.5 h-3.5 text-amber-500" />
-                Pressure Heatmap
+              <span className="flex items-center gap-1 bg-amber-50/90 px-2 py-0.5 rounded border border-amber-300 text-amber-900 font-semibold shadow-2xs">
+                <Flame className="w-3.5 h-3.5 text-amber-600" />
+                <span>Pressure Heatmap [M]</span>
+                {currentStrokes.length > 0 && (
+                  <span className="text-[10px] font-mono font-bold text-amber-700">
+                    ({penmanshipMetrics.consistencyScore}% Consistency)
+                  </span>
+                )}
+              </span>
+            </label>
+
+            {/* Symmetry Guide Mirroring Toggle */}
+            <label className="flex items-center gap-1.5 cursor-pointer select-none text-indigo-700 font-medium">
+              <input
+                type="checkbox"
+                checked={symmetryEnabled}
+                onChange={(e) => {
+                  setSymmetryEnabled(e.target.checked);
+                  if (e.target.checked) {
+                    setBeautifyNotice(
+                      `Symmetry Guide ON: horizontal mirroring active at X=${effectiveSymmetryAxisX}px [S]`
+                    );
+                    setTimeout(() => setBeautifyNotice(null), 2500);
+                  }
+                }}
+                className="rounded border-indigo-300 text-indigo-600 focus:ring-0"
+              />
+              <span className="flex items-center gap-1 bg-indigo-50/90 px-2 py-0.5 rounded border border-indigo-200 text-indigo-900 font-semibold shadow-2xs">
+                <Split className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Symmetry Guide [S]</span>
+                <span className="text-[10px] font-mono text-indigo-600/80">({effectiveSymmetryAxisX}px)</span>
               </span>
             </label>
           </div>
 
           <div className="flex items-center gap-4 flex-wrap">
+            {/* Calligraphy Nib Angle Slider (when Calligraphy tool active) */}
+            {penSettings.tool === 'calligraphy' && (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-amber-50 border border-amber-200 shadow-2xs">
+                <Feather className="w-3.5 h-3.5 text-amber-600" />
+                <span className="text-amber-900 font-semibold font-mono">
+                  Nib: {penSettings.angle ?? 45}°
+                </span>
+                <input
+                  type="range"
+                  min="0"
+                  max="90"
+                  step="5"
+                  value={penSettings.angle ?? 45}
+                  onChange={(e) =>
+                    setPenSettings((prev) => ({ ...prev, angle: Number(e.target.value) }))
+                  }
+                  className="w-16 accent-amber-600 cursor-pointer"
+                  title="Adjust Calligraphy fountain pen nib angle: 45° Italic, 30° Roman, 40° Gothic, 0° Flat"
+                />
+              </div>
+            )}
+
             {/* Stroke Width Slider */}
             <div className="flex items-center gap-2">
               <span className="text-slate-500 font-mono">Stroke: {penSettings.baseWidth}px</span>
@@ -2581,6 +4493,25 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                   setPenSettings((prev) => ({ ...prev, baseWidth: Number(e.target.value) }))
                 }
                 className="w-20 accent-slate-900"
+              />
+            </div>
+
+            {/* Real-time Stroke Smoothing Stabilizer Slider */}
+            <div className="flex items-center gap-2">
+              <span className="text-slate-500 font-mono">
+                Stabilizer: {Math.round((penSettings.smoothing ?? 0.5) * 100)}%
+              </span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={penSettings.smoothing ?? 0.5}
+                onChange={(e) =>
+                  setPenSettings((prev) => ({ ...prev, smoothing: parseFloat(e.target.value) }))
+                }
+                className="w-20 accent-indigo-600"
+                title="Adjust real-time stroke smoothing: 0% raw authentic jitter to 100% stabilized paths"
               />
             </div>
 
@@ -2633,8 +4564,12 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
       {/* Right Column: Glyph Metrics & Live Preview */}
       <aside
-        className={`w-full lg:w-80 bg-white border-t lg:border-t-0 lg:border-l border-slate-200 flex-col shrink-0 p-5 overflow-y-auto space-y-6 transition-all ${
-          isFocusMode ? 'hidden' : 'flex'
+        className={`w-full lg:w-80 bg-white border-t lg:border-t-0 lg:border-l border-slate-200 flex-col shrink-0 p-4 sm:p-5 overflow-y-auto space-y-6 transition-all ${
+          isFocusMode
+            ? 'hidden'
+            : mobileStudioTab === 'inspector'
+            ? 'flex flex-1 min-h-0'
+            : 'hidden lg:flex'
         }`}
       >
         <div>
@@ -2698,6 +4633,91 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                   Full Sheet
                 </button>
               )}
+            </div>
+          </div>
+
+          {/* Background Reference Image Tracing Card */}
+          <div className="mt-3 p-3 bg-gradient-to-br from-indigo-50/70 to-slate-50 border border-indigo-200/80 rounded-xl space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-indigo-950 flex items-center gap-1.5">
+                <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Reference Tracing</span>
+              </span>
+              <span
+                className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-bold ${
+                  underlay.src && underlay.visible
+                    ? 'bg-emerald-100 text-emerald-800'
+                    : underlay.src
+                    ? 'bg-slate-200 text-slate-700'
+                    : 'bg-indigo-100 text-indigo-800'
+                }`}
+              >
+                {underlay.src && underlay.visible
+                  ? 'Active'
+                  : underlay.src
+                  ? 'Hidden'
+                  : 'Empty'}
+              </span>
+            </div>
+
+            <p className="text-[11px] text-slate-600 leading-tight">
+              Import a sketch, photo, or calligraphy sample as a background underlay to trace complex character shapes.
+            </p>
+
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => underlayInputRef.current?.click()}
+                className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold transition-colors shadow-2xs"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>{underlay.src ? 'Replace Image' : 'Import Reference'}</span>
+              </button>
+              {underlay.src && (
+                <button
+                  onClick={() => setShowUnderlayPanel((prev) => !prev)}
+                  className="px-2.5 py-1.5 bg-white hover:bg-slate-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-semibold transition-colors"
+                  title="Adjust underlay opacity, scale, and positioning"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Quick Sample Presets for Complex Characters */}
+            <div className="pt-1 border-t border-indigo-100">
+              <div className="text-[10px] text-slate-500 font-semibold mb-1 uppercase tracking-wider font-mono">
+                Sample Guides:
+              </div>
+              <div className="grid grid-cols-2 gap-1 text-[11px]">
+                <button
+                  onClick={() => handleLoadSampleUnderlay('italic')}
+                  className="px-2 py-1 bg-white hover:bg-indigo-50 border border-indigo-200/70 rounded text-slate-700 font-medium transition-colors text-left truncate"
+                  title="Load Italic Calligraphy standard"
+                >
+                  Italic '{currentChar}'
+                </button>
+                <button
+                  onClick={() => handleLoadSampleUnderlay('blackletter')}
+                  className="px-2 py-1 bg-white hover:bg-indigo-50 border border-indigo-200/70 rounded text-slate-700 font-medium transition-colors text-left truncate"
+                  title="Load Gothic Blackletter shape"
+                >
+                  Gothic
+                </button>
+                <button
+                  onClick={() => handleLoadSampleUnderlay('kanji')}
+                  className="px-2 py-1 bg-white hover:bg-indigo-50 border border-indigo-200/70 rounded text-slate-700 font-medium transition-colors text-left truncate"
+                  title="Load Complex Multi-Stroke Kanji (繁)"
+                >
+                  Kanji (繁)
+                </button>
+                <button
+                  onClick={() => handleLoadSampleUnderlay('flourished')}
+                  className="px-2 py-1 bg-white hover:bg-indigo-50 border border-indigo-200/70 rounded text-slate-700 font-medium transition-colors text-left truncate"
+                  title="Load Ornate Flourished swashes"
+                >
+                  Flourish
+                </button>
+              </div>
             </div>
           </div>
 
@@ -3005,6 +5025,21 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         tool={penSettings.tool}
         pressureSensitivity={penSettings.pressureSensitivity}
         fontFamilyName="MyHandwriting"
+      />
+
+      {/* Copy Glyph & Anatomical Base Shapes Modal */}
+      <CopyGlyphModal
+        isOpen={isCopyGlyphModalOpen}
+        onClose={() => setIsCopyGlyphModalOpen(false)}
+        currentChar={currentChar}
+        currentStrokes={currentStrokes}
+        currentAdvanceWidth={currentGlyph.advanceWidth || 600}
+        glyphs={glyphs}
+        onApplyCopy={handleApplyCopyStrokes}
+        onBatchCopyToChars={handleBatchCopyToChars}
+        onSwitchChar={onSelectChar}
+        clipboardStrokes={glyphClipboard}
+        onSetClipboardStrokes={setGlyphClipboard}
       />
     </div>
   );

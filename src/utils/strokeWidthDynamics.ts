@@ -88,7 +88,10 @@ export function getGlyphStrokeMetrics(
   strokes: GlyphStroke[],
   baseWidth: number,
   tool: PenToolType = 'rollerball',
-  pressureSensitivity: boolean = true
+  pressureSensitivity: boolean = true,
+  nibAngle: number = 45,
+  pressureCurve: 'soft' | 'linear' | 'firm' | 'custom' = 'linear',
+  pressureGamma: number = 1.0
 ): GlyphStrokeMetrics {
   const allPoints: StrokePointMetric[] = [];
   let totalLength = 0;
@@ -161,7 +164,17 @@ export function getGlyphStrokeMetrics(
       const nx = -p.dy / len;
       const ny = p.dx / len;
 
-      const width = computeStrokePointWidth(baseWidth, p.pressure, tool, pressureSensitivity, p.dx, p.dy);
+      const width = computeStrokePointWidth(
+        baseWidth,
+        p.pressure,
+        tool,
+        pressureSensitivity,
+        p.dx,
+        p.dy,
+        nibAngle,
+        pressureCurve,
+        pressureGamma
+      );
       sumWidth += width;
 
       const metric: StrokePointMetric = {
@@ -468,7 +481,8 @@ export function drawStrokeWidthVisualIndicator(
     showHeatmap?: boolean;
     showMinMaxBadges?: boolean;
     showCenterline?: boolean;
-  } = {}
+  } = {},
+  nibAngle: number = 45
 ) {
   const {
     showContours = true,
@@ -478,7 +492,7 @@ export function drawStrokeWidthVisualIndicator(
     showCenterline = true,
   } = options;
 
-  const metrics = getGlyphStrokeMetrics(strokes, baseWidth, tool, pressureSensitivity);
+  const metrics = getGlyphStrokeMetrics(strokes, baseWidth, tool, pressureSensitivity, nibAngle);
   if (metrics.totalPoints === 0) return;
 
   ctx.save();
@@ -487,7 +501,7 @@ export function drawStrokeWidthVisualIndicator(
   if (showContours) {
     for (const stroke of strokes) {
       if (!stroke || stroke.length < 2) continue;
-      const { left, right } = generateStrokeContour(stroke, baseWidth, tool, pressureSensitivity);
+      const { left, right } = generateStrokeContour(stroke, baseWidth, tool, pressureSensitivity, nibAngle);
 
       // Translucent filled envelope
       ctx.beginPath();

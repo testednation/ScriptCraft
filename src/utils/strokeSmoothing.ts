@@ -98,6 +98,86 @@ export function applyNaturalPenTapers(stroke: GlyphStroke): GlyphStroke {
 }
 
 /**
+ * Real-time point stabilization for live drawing.
+ * Computes an exponentially smoothed target point from the incoming raw pointer position.
+ * @param rawPt The current raw point received from pointer event
+ * @param lastPt The previous smoothed point in the active stroke
+ * @param smoothing Smoothing factor from 0 (Raw) to 1 (Stabilized)
+ * @returns Stabilized point or null if distance is below the micro-jitter threshold
+ */
+export function stabilizePointRealtime(
+  rawPt: GlyphPoint,
+  lastPt: GlyphPoint,
+  smoothing: number
+): GlyphPoint | null {
+  const s = Math.max(0, Math.min(1, smoothing));
+  if (s === 0) {
+    // 100% Raw: capture every raw tremor, only filter exact duplicate positions
+    if (Math.hypot(rawPt.x - lastPt.x, rawPt.y - lastPt.y) < 1.2) return null;
+    return rawPt;
+  }
+
+  // Adaptive exponential filter:
+  // s = 0.2 -> alpha = 0.85 (responsive, light tremor reduction)
+  // s = 0.5 -> alpha = 0.55 (natural cursive stabilization)
+  // s = 0.8 -> alpha = 0.28 (silky smooth)
+  // s = 1.0 -> alpha = 0.12 (heavy calligraphic stabilizer)
+  const alpha = Math.max(0.12, 1.0 - s * 0.85);
+
+  const targetX = Math.round(lastPt.x + (rawPt.x - lastPt.x) * alpha);
+  const targetY = Math.round(lastPt.y + (rawPt.y - lastPt.y) * alpha);
+
+  // Dynamic distance threshold to eliminate micro-jitter without losing fast curves
+  const minDist = 1.8 + s * 3.5;
+  if (Math.hypot(targetX - lastPt.x, targetY - lastPt.y) < minDist) {
+    return null;
+  }
+
+  let finalPressure = rawPt.pressure ?? 1;
+  if (lastPt.pressure !== undefined && rawPt.pressure !== undefined) {
+    finalPressure = Math.round((lastPt.pressure * (1 - alpha) + rawPt.pressure * alpha) * 100) / 100;
+  }
+
+  return {
+    x: targetX,
+    y: targetY,
+    pressure: finalPressure,
+  };
+}
+
+/**
+ * Finalizes and relaxes a drawn stroke based on smoothing level.
+ * When smoothing is 0 (Raw), returns stroke unmodified.
+ * When smoothing > 0, removes jitter, applies Chaikin smoothing and natural pen tapers.
+ */
+export function finalizeStrokeWithSmoothing(
+  stroke: GlyphStroke,
+  smoothing: number
+): GlyphStroke {
+  if (stroke.length <= 2 || smoothing < 0.15) {
+    return stroke; // Keep raw authentic path
+  }
+
+  const s = Math.max(0, Math.min(1, smoothing));
+  let result = stroke;
+
+  // Step 1: Remove tremor jitter with threshold proportional to smoothing
+  const jitterDist = 1.5 + s * 3.0;
+  result = removeTremorJitter(result, jitterDist);
+
+  // Step 2: Chaikin smoothing
+  const iterations = s >= 0.7 ? 2 : 1;
+  result = chaikinSmoothStroke(result, iterations);
+
+  // Step 3: Natural pen tapers if smoothing is moderate to high
+  if (s >= 0.35) {
+    result = applyNaturalPenTapers(result);
+  }
+
+  return result;
+}
+
+/**
  * Snaps the lowest points of a glyph to the typographic baseline.
  * If the glyph naturally rests on the baseline (not descenders like g, p, y, q, j),
  * aligns its bottom-most resting contact points to CANVAS_BASELINE.

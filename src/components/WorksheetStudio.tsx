@@ -14,9 +14,11 @@ import {
   BookOpen,
   Share2,
   Edit3,
+  Loader2,
 } from 'lucide-react';
 import { FontMetadata, GlyphData, PenSettings } from '../types/font';
 import { strokesToSvgPath } from '../utils/fontEngine';
+import { generateWorksheetPdf } from '../utils/worksheetPdf';
 
 interface WorksheetStudioProps {
   metadata: FontMetadata;
@@ -147,6 +149,11 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
   const [showStudentHeader, setShowStudentHeader] = useState<boolean>(true);
   const [paperTone, setPaperTone] = useState<'ivory' | 'white' | 'sepia'>('ivory');
 
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
+  const [pdfProgress, setPdfProgress] = useState<number>(0);
+  const [pdfStatus, setPdfStatus] = useState<string>('');
+  const [pdfToast, setPdfToast] = useState<string | null>(null);
+
   const sheetRef = useRef<HTMLDivElement | null>(null);
 
   // When ruling style changes, optionally adopt its natural slant
@@ -164,6 +171,54 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
     window.print();
   };
 
+  const handleDownloadPdf = async (customPages: number = 1) => {
+    if (isGeneratingPdf) return;
+    setIsGeneratingPdf(true);
+    setPdfProgress(10);
+    setPdfStatus('Initializing printable PDF...');
+
+    try {
+      await generateWorksheetPdf({
+        metadata,
+        glyphs,
+        liveFontFamily,
+        penSettings,
+        rulingStyle,
+        tracingMode,
+        practiceText,
+        paperFormat,
+        paperTone,
+        lineHeight,
+        customSlant,
+        repeatLines,
+        showStudentHeader,
+        pageCount: customPages,
+        ghostOpacity: guideOpacity / 100,
+        onProgress: (progress, status) => {
+          setPdfProgress(progress);
+          setPdfStatus(status);
+        },
+      });
+
+      setPdfToast(
+        `Downloaded ${metadata.familyName || 'Practice'}_Worksheet.pdf (${paperFormat.toUpperCase()})`
+      );
+      setTimeout(() => {
+        setPdfToast(null);
+      }, 4500);
+    } catch (err) {
+      console.error('Failed to generate PDF:', err);
+      setPdfToast('Error generating PDF worksheet. Please try again.');
+      setTimeout(() => {
+        setPdfToast(null);
+      }, 4000);
+    } finally {
+      setIsGeneratingPdf(false);
+      setPdfProgress(0);
+      setPdfStatus('');
+    }
+  };
+
   const paperBackgrounds = {
     ivory: '#fcfbf7',
     white: '#ffffff',
@@ -172,6 +227,14 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+      {/* Toast Notification */}
+      {pdfToast && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-3 bg-slate-900 text-white rounded-xl shadow-2xl border border-slate-700 animate-in fade-in slide-in-from-bottom-3 duration-200">
+          <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span className="text-xs font-medium">{pdfToast}</span>
+        </div>
+      )}
+
       {/* Screen Controls Header (Hidden in Print) */}
       <div className="print:hidden space-y-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -185,18 +248,49 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
               Penmanship Practice Worksheets
             </h1>
             <p className="text-xs sm:text-sm text-slate-600 mt-1 max-w-2xl">
-              Generate custom lined calligraphy and handwriting practice sheets with your own custom font ghosted as tracing guidelines. Print directly onto 8.5×11" or A4 paper.
+              Generate custom lined calligraphy and handwriting practice sheets with your own custom font ghosted as tracing guidelines. Download directly as a high-resolution printable PDF or send to printer.
             </p>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* Primary Direct Download PDF Button */}
+            <button
+              onClick={() => handleDownloadPdf(1)}
+              disabled={isGeneratingPdf}
+              className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg active:scale-[0.98] transition-all text-xs font-semibold shadow-sm disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+              title="Generate and download printable PDF handwriting practice sheet"
+            >
+              {isGeneratingPdf ? (
+                <Loader2 className="w-4 h-4 animate-spin text-white" />
+              ) : (
+                <Download className="w-4 h-4 text-white" />
+              )}
+              <span>
+                {isGeneratingPdf
+                  ? `Generating PDF (${pdfProgress}%)...`
+                  : `Download PDF (${paperFormat === 'letter' ? 'Letter' : 'A4'})`}
+              </span>
+            </button>
+
+            {/* 3-Page Complete Drill Packet PDF */}
+            <button
+              onClick={() => handleDownloadPdf(3)}
+              disabled={isGeneratingPdf}
+              className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg active:scale-[0.98] transition-all text-xs font-medium border border-slate-200 shadow-2xs disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+              title="Download complete 3-page practice packet (Pangrams, Alphabet Aa-Zz, and Numbers)"
+            >
+              <FileText className="w-3.5 h-3.5 text-slate-600" />
+              <span>3-Page Packet PDF</span>
+            </button>
+
+            {/* Standard Browser Print / System Dialog */}
             <button
               onClick={handlePrint}
-              className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 active:scale-[0.98] transition-all text-xs font-semibold shadow-sm"
-              title="Print worksheet directly onto your printer or Save as PDF"
+              className="flex items-center gap-2 px-3 py-2 bg-slate-900 text-white rounded-lg hover:bg-slate-800 active:scale-[0.98] transition-all text-xs font-semibold shadow-sm cursor-pointer"
+              title="Print worksheet directly onto your printer or Save as PDF via browser print"
             >
               <Printer className="w-4 h-4 text-emerald-400" />
-              <span>Print Worksheet / PDF</span>
+              <span>Print / System Dialog</span>
             </button>
           </div>
         </div>
@@ -314,32 +408,60 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
                 />
               </div>
 
-              <div className="flex items-center gap-4 pt-1">
-                <label className="flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={showStudentHeader}
-                    onChange={(e) => setShowStudentHeader(e.target.checked)}
-                    className="rounded text-slate-900 focus:ring-slate-900"
-                  />
-                  <span>Name & Date Header</span>
-                </label>
+              {/* Paper Format & Tone */}
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-500 font-medium">Paper Format:</span>
+                  <div className="flex items-center gap-1">
+                    {(['letter', 'a4'] as const).map((fmt) => (
+                      <button
+                        key={fmt}
+                        onClick={() => setPaperFormat(fmt)}
+                        className={`px-2 py-0.5 rounded text-[11px] font-semibold uppercase border transition-colors cursor-pointer ${
+                          paperFormat === fmt
+                            ? 'border-emerald-600 bg-emerald-50 text-emerald-900 shadow-2xs'
+                            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {fmt === 'letter' ? 'Letter (8.5×11")' : 'A4 (210×297)'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
 
-                <div className="flex items-center gap-1 text-xs">
-                  <span className="text-slate-500">Tone:</span>
-                  {(['ivory', 'white', 'sepia'] as const).map((tone) => (
-                    <button
-                      key={tone}
-                      onClick={() => setPaperTone(tone)}
-                      className={`px-1.5 py-0.5 rounded text-[10px] capitalize border ${
-                        paperTone === tone
-                          ? 'border-slate-900 bg-slate-900 text-white'
-                          : 'border-slate-200 bg-white text-slate-600'
-                      }`}
-                    >
-                      {tone}
-                    </button>
-                  ))}
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-500 font-medium">Tone:</span>
+                  <div className="flex items-center gap-1">
+                    {(['ivory', 'white', 'sepia'] as const).map((tone) => (
+                      <button
+                        key={tone}
+                        onClick={() => setPaperTone(tone)}
+                        className={`px-2 py-0.5 rounded text-[11px] capitalize border transition-colors cursor-pointer ${
+                          paperTone === tone
+                            ? 'border-slate-900 bg-slate-900 text-white shadow-2xs'
+                            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {tone}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-1">
+                  <label className="flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={showStudentHeader}
+                      onChange={(e) => setShowStudentHeader(e.target.checked)}
+                      className="rounded text-slate-900 focus:ring-slate-900 cursor-pointer"
+                    />
+                    <span>Name & Date Header</span>
+                  </label>
+
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    300 DPI PDF Ready
+                  </span>
                 </div>
               </div>
             </div>
@@ -376,11 +498,13 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
       </div>
 
       {/* Printable Sheet Viewport (This section prints cleanly on letter/A4) */}
-      <div className="flex justify-center print:block print:p-0">
+      <div className="flex justify-center print:block print:p-0 overflow-x-auto pb-6">
         <div
           ref={sheetRef}
           style={{ backgroundColor: paperBackgrounds[paperTone] }}
-          className="w-full max-w-[850px] min-h-[1100px] border border-slate-300 shadow-xl rounded-lg p-8 sm:p-12 print:border-none print:shadow-none print:rounded-none print:m-0 print:p-6 print:w-full print:max-w-none transition-all flex flex-col justify-between"
+          className={`w-full min-w-[340px] ${
+            paperFormat === 'a4' ? 'max-w-[800px] min-h-[1130px]' : 'max-w-[850px] min-h-[1100px]'
+          } border border-slate-300 shadow-xl rounded-lg p-4 sm:p-8 md:p-12 print:border-none print:shadow-none print:rounded-none print:m-0 print:p-6 print:w-full print:max-w-none transition-all flex flex-col justify-between`}
         >
           {/* Sheet Header */}
           <div>
@@ -391,7 +515,7 @@ export const WorksheetStudio: React.FC<WorksheetStudioProps> = ({
                     {metadata.familyName || 'ScriptCraft Studio'} · Penmanship Practice
                   </div>
                   <div className="text-[11px] text-slate-500 font-sans">
-                    Ruling: {RULING_PRESETS.find((p) => p.id === rulingStyle)?.name} · Scale: {lineHeight}px
+                    Ruling: {RULING_PRESETS.find((p) => p.id === rulingStyle)?.name} · Format: {paperFormat.toUpperCase()} ({paperFormat === 'letter' ? '8.5×11"' : '210×297mm'}) · Scale: {lineHeight}px{customSlant > 0 ? ` · ${customSlant}° Slant` : ''}
                   </div>
                 </div>
 

@@ -13,6 +13,7 @@ import { ExportModal } from './components/ExportModal';
 import { OfflineExportModal } from './components/OfflineExportModal';
 import { KeyboardShortcutsModal } from './components/KeyboardShortcutsModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { MobileBottomNav } from './components/MobileBottomNav';
 import { FontMetadata, GlyphData, GlyphStroke, GlyphVariant, HandwritingPreset, KerningMap, LigatureData, PenSettings } from './types/font';
 import { HANDWRITING_PRESETS } from './utils/presets';
 import { buildOpenTypeFont, registerLiveFontFace } from './utils/fontEngine';
@@ -47,6 +48,7 @@ export default function App() {
     tool: 'rollerball',
     baseWidth: 14,
     smoothing: 0.5,
+    angle: 45,
     pressureSensitivity: true,
   });
 
@@ -95,7 +97,8 @@ export default function App() {
         penSettings.baseWidth,
         kerningMap,
         ligatures,
-        penSettings.pressureSensitivity
+        penSettings.pressureSensitivity,
+        penSettings.angle ?? 45
       );
       const uniqueName = `ScriptCraft-Live-${Date.now()}`;
       await registerLiveFontFace(font, uniqueName);
@@ -108,6 +111,7 @@ export default function App() {
     fontMetadata,
     penSettings.tool,
     penSettings.baseWidth,
+    penSettings.angle,
     penSettings.pressureSensitivity,
     kerningMap,
     ligatures,
@@ -442,7 +446,7 @@ export default function App() {
       )}
 
       {/* Main Content Area */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col pb-16 md:pb-0">
         {activeTab === 'studio' && (
           <GlyphStudio
             currentChar={currentChar}
@@ -593,6 +597,7 @@ export default function App() {
         kerningMap={kerningMap}
         ligaturesMap={ligatures}
         pressureSensitivity={penSettings.pressureSensitivity}
+        nibAngle={penSettings.angle ?? 45}
         onOpenOfflineExport={() => setIsOfflineExportOpen(true)}
       />
 
@@ -617,6 +622,17 @@ export default function App() {
 
       {/* Offline Status Connectivity Banner */}
       <OfflineIndicator />
+
+      {/* Mobile Bottom Navigation Bar (< md) */}
+      <MobileBottomNav
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        completedGlyphsCount={completedCount}
+        totalGlyphsCount={totalCount}
+        onQuickDownload={() => setIsExportOpen(true)}
+        onOpenOfflineExport={() => setIsOfflineExportOpen(true)}
+        onOpenShortcuts={() => setIsShortcutsOpen(true)}
+      />
     </div>
   );
 }
