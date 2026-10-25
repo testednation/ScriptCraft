@@ -160,34 +160,55 @@ export function getThemeColors(theme: TracingColorTheme): ThemeColors {
   return THEME_COLOR_MAP[theme] || THEME_COLOR_MAP.blueprint;
 }
 
+export const STANDARD_LATIN_UPPERCASE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+export const STANDARD_LATIN_LOWERCASE = 'abcdefghijklmnopqrstuvwxyz'.split('');
+export const STANDARD_LATIN_ALL = [...STANDARD_LATIN_UPPERCASE, ...STANDARD_LATIN_LOWERCASE];
+
+export function isStandardLatinChar(char: string): boolean {
+  return /^[a-zA-Z]$/.test(char);
+}
+
+export const TRACING_OPACITY_PRESETS = [
+  { label: 'Faint', value: 0.12, hint: 'Whisper guide' },
+  { label: 'Balanced', value: 0.22, hint: 'Recommended for pen tracing' },
+  { label: 'Crisp', value: 0.38, hint: 'High contrast architectural outline' },
+  { label: 'Bold', value: 0.52, hint: 'Prominent template' },
+];
+
 /**
- * Calculates font styling and base size to align with typographic lines.
+ * Calculates font styling and base size to accurately align with typographic lines.
  * Cap Height (240) to Baseline (600) = 360px vertical height.
+ * Base sizes are calibrated so standard Latin capitals (A-Z) span exactly 360px.
  */
 function getFontStyle(style: TracingStandardFont, scale: number = 1.0): { font: string; size: number } {
-  const baseSize = 365 * scale;
+  let baseSize = 500 * scale;
   let fontFace = '"Plus Jakarta Sans", system-ui, sans-serif';
   let weight = '600';
 
   switch (style) {
     case 'classic-serif':
+      baseSize = 525 * scale;
       fontFace = '"Playfair Display", Georgia, serif';
       weight = '600';
       break;
     case 'cursive-script':
+      baseSize = 570 * scale;
       fontFace = '"Caveat", cursive';
       weight = '700';
       break;
     case 'drafting-mono':
+      baseSize = 495 * scale;
       fontFace = '"JetBrains Mono", monospace';
       weight = '600';
       break;
     case 'geometric':
+      baseSize = 505 * scale;
       fontFace = '"Plus Jakarta Sans", sans-serif';
       weight = '700';
       break;
     case 'modern-sans':
     default:
+      baseSize = 500 * scale;
       fontFace = '"Plus Jakarta Sans", system-ui, sans-serif';
       weight = '700';
       break;

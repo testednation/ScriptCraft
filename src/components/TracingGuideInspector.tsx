@@ -14,6 +14,7 @@ import {
   Layers,
   Ruler,
   Info,
+  Ghost,
   Type,
   Grid,
 } from 'lucide-react';
@@ -26,6 +27,7 @@ import {
   TracingColorTheme,
   compareDrawnGlyphWithStandard,
   getThemeColors,
+  TRACING_OPACITY_PRESETS,
 } from '../utils/tracingGuide';
 
 interface TracingGuideInspectorProps {
@@ -78,19 +80,19 @@ export const TracingGuideInspector: React.FC<TracingGuideInspectorProps> = ({
               settings.enabled ? 'bg-sky-100 text-sky-700' : 'bg-slate-200 text-slate-500'
             }`}
           >
-            <Compass className="w-4 h-4" />
+            <Ghost className="w-4 h-4" />
           </div>
           <div>
             <div className="flex items-center gap-1.5">
               <span className="text-xs font-bold text-slate-900 font-['Plus_Jakarta_Sans']">
-                Tracing Guide Overlay
+                Ghost Template Guide
               </span>
               <kbd className="px-1 py-0.2 bg-white border border-slate-200 rounded text-[9px] font-mono text-slate-500" title="Keyboard shortcut: T">
                 T
               </kbd>
             </div>
             <p className="text-[10px] text-slate-500 leading-none mt-0.5">
-              Ghosted standard form for proportion consistency
+              Semi-transparent Latin archetype for manual handwriting tracing
             </p>
           </div>
         </div>
@@ -209,27 +211,49 @@ export const TracingGuideInspector: React.FC<TracingGuideInspectorProps> = ({
             </div>
           </div>
 
-          {/* Opacity Slider */}
-          <div className="space-y-1.5">
+          {/* Opacity Slider & Presets */}
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-slate-700 font-medium">Guide Ghost Opacity</span>
+              <span className="text-slate-700 font-medium">Ghost Template Opacity</span>
               <span className="font-mono text-slate-600 tabular-nums">
                 {Math.round(settings.opacity * 100)}%
               </span>
             </div>
+
+            <div className="grid grid-cols-4 gap-1 p-0.5 bg-slate-100 rounded-lg text-[10px]">
+              {TRACING_OPACITY_PRESETS.map((preset) => {
+                const isSelected = Math.abs(settings.opacity - preset.value) < 0.05;
+                return (
+                  <button
+                    key={preset.label}
+                    onClick={() => updateSetting('opacity', preset.value)}
+                    className={`py-1 px-1 rounded text-center transition-all ${
+                      isSelected
+                        ? 'bg-sky-600 text-white font-bold shadow-2xs'
+                        : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                    }`}
+                    title={`${preset.label} (${Math.round(preset.value * 100)}%): ${preset.hint}`}
+                  >
+                    <div>{preset.label}</div>
+                    <div className="text-[9px] font-mono opacity-80">{Math.round(preset.value * 100)}%</div>
+                  </button>
+                );
+              })}
+            </div>
+
             <input
               type="range"
-              min="0.06"
-              max="0.50"
+              min="0.05"
+              max="0.60"
               step="0.02"
               value={settings.opacity}
               onChange={(e) => updateSetting('opacity', parseFloat(e.target.value))}
               className="w-full accent-sky-600 cursor-pointer"
             />
             <div className="flex justify-between text-[10px] text-slate-400 font-mono">
-              <span>Faint (6%)</span>
-              <span>Subtle (22%)</span>
-              <span>Prominent (50%)</span>
+              <span>Faint (5%)</span>
+              <span>Balanced (22%)</span>
+              <span>Crisp (60%)</span>
             </div>
           </div>
 

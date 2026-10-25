@@ -1,5 +1,7 @@
 import opentype from 'opentype.js';
 import { FontMetadata, GlyphData, GlyphStroke, KerningMap, LigatureData } from '../types/font';
+import { skewGlyphStrokes } from './slantCorrection';
+export { skewGlyphStrokes };
 
 // Canvas dimension constants
 export const CANVAS_SIZE = 800;
@@ -466,9 +468,14 @@ export function buildOpenTypeFont(
     if (!glyphData || glyphData.strokes.length === 0) continue;
 
     const charRotation = glyphData.rotation || 0;
-    const strokesForFont = charRotation !== 0
-      ? rotateGlyphStrokes(glyphData.strokes, charRotation)
-      : glyphData.strokes;
+    const charSlant = glyphData.slant || 0;
+    let strokesForFont = glyphData.strokes;
+    if (charSlant !== 0) {
+      strokesForFont = skewGlyphStrokes(strokesForFont, charSlant);
+    }
+    if (charRotation !== 0) {
+      strokesForFont = rotateGlyphStrokes(strokesForFont, charRotation);
+    }
 
     const opPath = strokesToOpenTypePath(
       strokesForFont,
@@ -507,9 +514,14 @@ export function buildOpenTypeFont(
       glyphData.variants.forEach((variant, vIdx) => {
         if (!variant.strokes || variant.strokes.length === 0) return;
         const varRotation = variant.rotation ?? charRotation;
-        const varStrokesForFont = varRotation !== 0
-          ? rotateGlyphStrokes(variant.strokes, varRotation)
-          : variant.strokes;
+        const varSlant = variant.slant ?? charSlant;
+        let varStrokesForFont = variant.strokes;
+        if (varSlant !== 0) {
+          varStrokesForFont = skewGlyphStrokes(varStrokesForFont, varSlant);
+        }
+        if (varRotation !== 0) {
+          varStrokesForFont = rotateGlyphStrokes(varStrokesForFont, varRotation);
+        }
 
         const varPath = strokesToOpenTypePath(
           varStrokesForFont,

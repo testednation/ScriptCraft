@@ -14,6 +14,7 @@ export interface GlyphVariant {
   leftBearing?: number;
   rightBearing?: number;
   rotation?: number; // Character-specific tilt / rotation angle in degrees
+  slant?: number; // Character-specific skew / slant correction angle in degrees
 }
 
 export interface GlyphData {
@@ -26,6 +27,7 @@ export interface GlyphData {
   lastModified: number;
   variants?: GlyphVariant[];
   rotation?: number; // Character-specific tilt / rotation angle in degrees
+  slant?: number; // Character-specific skew / slant correction angle in degrees
 }
 
 export interface FontMetadata {

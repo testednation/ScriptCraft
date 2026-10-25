@@ -41,8 +41,23 @@ import {
   ClipboardCheck,
   PenTool,
   LayoutGrid,
+  Grid,
+  Magnet,
+  Scissors,
+  GitCommit,
+  Type,
+  Italic,
 } from 'lucide-react';
 import { GlyphData, GlyphStroke, GlyphVariant, PenSettings, PenToolType } from '../types/font';
+import {
+  skewPoint,
+  skewGlyphStrokes,
+  batchSlantAllGlyphs,
+  drawSlantGuideOverlay,
+  SLANT_PRESETS,
+  getSlantDescription,
+  SlantPreset,
+} from '../utils/slantCorrection';
 import {
   CANVAS_ASCENDER,
   CANVAS_BASELINE,
@@ -78,9 +93,45 @@ import {
   computePenmanshipConsistency,
   balanceStrokesPressure,
   boostStrokesPressureContrast,
+  computeCrossCharacterWeightDistribution,
   PressureColorPalette,
   PenmanshipMetrics,
+  CrossCharacterWeightMetrics,
 } from '../utils/pressureHeatmap';
+import {
+  GridSnapSettings,
+  DEFAULT_GRID_SNAP_SETTINGS,
+  snapPointToGrid,
+  snapStrokeEndpoints,
+  snapGlyphStrokesEndpoints,
+  computeGridAlignmentMetrics,
+  drawCanvasGridOverlay,
+} from '../utils/gridSnap';
+import {
+  ReflectionSettings,
+  DEFAULT_REFLECTION_SETTINGS,
+  ReflectionType,
+  computeReflectionAxes,
+  reflectPoint,
+  reflectStroke,
+  reflectStrokes,
+  mirrorHalfStrokes,
+  computeCharacterBalanceMetrics,
+  CharacterBalanceMetrics,
+  drawReflectionCanvasOverlay,
+  HORIZONTAL_SYMMETRY_PRESETS,
+  VERTICAL_SYMMETRY_PRESETS,
+  QUAD_SYMMETRY_PRESETS,
+} from '../utils/reflectionTool';
+import {
+  SimplifySettings,
+  DEFAULT_SIMPLIFY_SETTINGS,
+  SIMPLIFY_PRESETS,
+  simplifyGlyphStrokes,
+  simplifyStroke,
+  batchSimplifyAllGlyphs,
+  drawSimplifyCanvasOverlay,
+} from '../utils/pathSimplification';
 import { SingleCharCropModal } from './SingleCharCropModal';
 import { StrokeWidthInspector } from './StrokeWidthInspector';
 import { TracingGuideInspector } from './TracingGuideInspector';
@@ -98,6 +149,14 @@ import {
   TracingGuideSettings,
   DEFAULT_TRACING_SETTINGS,
   drawTracingGuideOverlay,
+  STANDARD_FONT_OPTIONS,
+  STANDARD_LATIN_UPPERCASE,
+  STANDARD_LATIN_LOWERCASE,
+  TRACING_OPACITY_PRESETS,
+  isStandardLatinChar,
+  compareDrawnGlyphWithStandard,
+  TracingRenderMode,
+  TracingColorTheme,
 } from '../utils/tracingGuide';
 
 interface GlyphStudioProps {
@@ -109,7 +168,8 @@ interface GlyphStudioProps {
     strokes: GlyphStroke[],
     advanceWidth?: number,
     variants?: GlyphVariant[],
-    rotation?: number
+    rotation?: number,
+    slant?: number
   ) => void;
   onUpdateAllGlyphs?: (glyphs: Record<string, GlyphData>) => void;
   penSettings: PenSettings;
@@ -238,12 +298,29 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
   // Mobile Studio tab selector for screens < lg ('canvas' | 'matrix' | 'inspector')
   const [mobileStudioTab, setMobileStudioTab] = useState<'canvas' | 'matrix' | 'inspector'>('canvas');
 
-  // Symmetry Guide: mirrors strokes horizontally across center axis to assist drawing symmetrical characters (e.g. O, A, M, H)
-  const [symmetryEnabled, setSymmetryEnabled] = useState<boolean>(false);
-  const [symmetryAxisMode, setSymmetryAxisMode] = useState<'metric' | 'canvas'>('metric');
-  const [symmetryAxisOffset, setSymmetryAxisOffset] = useState<number>(0);
-  const [showSymmetryPanel, setShowSymmetryPanel] = useState<boolean>(false);
-  const [hoverCanvasPt, setHoverCanvasPt] = useState<{ x: number; y: number } | null>(null);
+  // Reflection Tool: Vertical and Horizontal axis reflection for symmetrical stroke balance
+  const [reflectionSettings, setReflectionSettings] = useState<ReflectionSettings>(DEFAULT_REFLECTION_SETTINGS);
+  const [showReflectionPanel, setShowReflectionPanel] = useState<boolean>(false);
+  const [hoverCanvasPt, setHoverCanvasPt] = useState<{ x: number; y: number; pressure?: number } | null>(null);
+
+  // Backward-compatibility aliases
+  const symmetryEnabled = reflectionSettings.enabled;
+  const setSymmetryEnabled = (valOrFn: boolean | ((prev: boolean) => boolean)) => {
+    setReflectionSettings((prev) => ({
+      ...prev,
+      enabled: typeof valOrFn === 'function' ? valOrFn(prev.enabled) : valOrFn,
+    }));
+  };
+  const showSymmetryPanel = showReflectionPanel;
+  const setShowSymmetryPanel = setShowReflectionPanel;
+
+  // Snap to Grid: automatically aligns stroke endpoints to configurable grid
+  const [gridSettings, setGridSettings] = useState<GridSnapSettings>(DEFAULT_GRID_SNAP_SETTINGS);
+  const [showGridConfigPanel, setShowGridConfigPanel] = useState<boolean>(false);
+
+  // Simplify Paths: Ramer-Douglas-Peucker (RDP) algorithm to decimate control points while preserving shape
+  const [simplifySettings, setSimplifySettings] = useState<SimplifySettings>(DEFAULT_SIMPLIFY_SETTINGS);
+  const [showSimplifyPanel, setShowSimplifyPanel] = useState<boolean>(false);
 
   // Common typographical characters with bilateral/horizontal reflective symmetry
   const SYMMETRY_PRESET_CHARS = useMemo(
@@ -416,6 +493,8 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
   // Tracing Guide overlay state (ghosted character standard form for proportions)
   const [tracingGuide, setTracingGuide] = useState<TracingGuideSettings>(DEFAULT_TRACING_SETTINGS);
+  const [showTracingGuidePanel, setShowTracingGuidePanel] = useState<boolean>(false);
+  const [tracingLatinCaseTab, setTracingLatinCaseTab] = useState<'upper' | 'lower'>('upper');
 
   // Allow pasting an image directly onto the drawing studio canvas
   useEffect(() => {
@@ -558,6 +637,30 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     return computePenmanshipConsistency(currentStrokes);
   }, [currentStrokes]);
 
+  // Compute endpoint alignment metrics against current grid pitch
+  const gridAlignmentMetrics = useMemo(() => {
+    return computeGridAlignmentMetrics(currentStrokes, gridSettings.gridSize);
+  }, [currentStrokes, gridSettings.gridSize]);
+
+  // Compute Ramer-Douglas-Peucker simplification metrics for active character
+  const simplificationMetrics = useMemo(() => {
+    return simplifyGlyphStrokes(
+      currentStrokes,
+      simplifySettings.epsilon,
+      simplifySettings.curveRelaxation
+    ).metrics;
+  }, [currentStrokes, simplifySettings.epsilon, simplifySettings.curveRelaxation]);
+
+  // Compute live proportion comparison against standard Latin archetype template
+  const tracingProportionComparison = useMemo(() => {
+    return compareDrawnGlyphWithStandard(currentChar, currentStrokes, tracingGuide, penSettings.baseWidth);
+  }, [currentChar, currentStrokes, tracingGuide, penSettings.baseWidth]);
+
+  // Compute font-wide cross-character line-weight and stroke pressure balance
+  const crossCharWeightMetrics = useMemo(() => {
+    return computeCrossCharacterWeightDistribution(glyphs, currentChar, penSettings.baseWidth);
+  }, [glyphs, currentChar, penSettings.baseWidth, currentStrokes]);
+
   // Compute character horizontal bounding box center and baseline pivot point
   const { pivotX, pivotY } = useMemo(() => {
     const px =
@@ -696,49 +799,130 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setTimeout(() => setBeautifyNotice(null), 2500);
   }, [currentStrokes, updateActiveStrokes, currentChar]);
 
-  // Calculate effective horizontal symmetry axis coordinate X
-  const effectiveSymmetryAxisX = useMemo(() => {
-    const base =
-      symmetryAxisMode === 'metric'
-        ? CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36
-        : CANVAS_SIZE / 2; // 400px
-    return Math.round(base + symmetryAxisOffset);
-  }, [symmetryAxisMode, currentGlyph.advanceWidth, symmetryAxisOffset]);
+  // Calculate effective reflection axis coordinates:
+  // axisX is the vertical line (for horizontal reflection L <-> R)
+  // axisY is the horizontal line (for vertical reflection T <-> B)
+  const { axisX: reflectionAxisX, axisY: reflectionAxisY } = useMemo(() => {
+    return computeReflectionAxes(reflectionSettings, {
+      advanceWidth: currentGlyph.advanceWidth || 600,
+      baseline: guideConfig.baseline,
+      capHeight: guideConfig.capHeight,
+      bboxCenter: currentBBox ? { x: currentBBox.centerX, y: currentBBox.centerY } : null,
+    });
+  }, [
+    reflectionSettings,
+    currentGlyph.advanceWidth,
+    guideConfig.baseline,
+    guideConfig.capHeight,
+    currentBBox,
+  ]);
 
-  // Mirror one half of the glyph across the symmetry axis (Left → Right or Right → Left)
-  const handleMirrorSide = useCallback(
-    (sourceSide: 'left' | 'right') => {
+  const effectiveSymmetryAxisX = reflectionAxisX;
+  const effectiveSymmetryAxisY = reflectionAxisY;
+
+  // Character optical balance metrics against reflection axes
+  const characterBalanceMetrics = useMemo(() => {
+    return computeCharacterBalanceMetrics(currentStrokes, reflectionAxisX, reflectionAxisY);
+  }, [currentStrokes, reflectionAxisX, reflectionAxisY]);
+
+  // Mirror half strokes across the active reflection axis (horizontal or vertical)
+  const handleMirrorHalf = useCallback(
+    (direction: 'left-to-right' | 'right-to-left' | 'top-to-bottom' | 'bottom-to-top') => {
       if (currentStrokes.length === 0) return;
       setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
       setRedoStack([]);
-
-      // Filter strokes that are predominantly on the source side (or mirror all if strokes span across)
-      const sourceStrokes = currentStrokes.filter((stroke) => {
-        if (stroke.length === 0) return false;
-        const avgX = stroke.reduce((sum, p) => sum + p.x, 0) / stroke.length;
-        return sourceSide === 'left'
-          ? avgX <= effectiveSymmetryAxisX + 12
-          : avgX >= effectiveSymmetryAxisX - 12;
-      });
-
-      const strokesToUse = sourceStrokes.length > 0 ? sourceStrokes : currentStrokes;
-      const mirroredStrokes: GlyphStroke[] = strokesToUse.map((stroke) =>
-        stroke.map((p) => ({
-          x: Math.round(2 * effectiveSymmetryAxisX - p.x),
-          y: p.y,
-          pressure: p.pressure,
-        }))
-      );
-
-      const combined = [...strokesToUse, ...mirroredStrokes];
-      updateActiveStrokes(combined);
-      setBeautifyNotice(
-        `Mirrored ${sourceSide === 'left' ? 'Left → Right' : 'Right → Left'} across symmetry axis (${combined.length} strokes)`
-      );
+      const result = mirrorHalfStrokes(currentStrokes, reflectionAxisX, reflectionAxisY, direction);
+      updateActiveStrokes(result.strokes);
+      const dirLabels: Record<string, string> = {
+        'left-to-right': 'Left ➔ Right (Vertical Axis)',
+        'right-to-left': 'Right ➔ Left (Vertical Axis)',
+        'top-to-bottom': 'Top ➔ Bottom (Horizontal Axis)',
+        'bottom-to-top': 'Bottom ➔ Top (Horizontal Axis)',
+      };
+      setBeautifyNotice(`Mirrored ${dirLabels[direction] || direction} (${result.mirroredCount} strokes added)`);
+      if (onRecordHistory) {
+        onRecordHistory(`Reflected half strokes ${direction} on '${currentChar}'`);
+      }
       setTimeout(() => setBeautifyNotice(null), 2500);
     },
-    [currentStrokes, effectiveSymmetryAxisX, updateActiveStrokes]
+    [currentStrokes, reflectionAxisX, reflectionAxisY, updateActiveStrokes, onRecordHistory, currentChar]
   );
+
+  // Backward-compatible handleMirrorSide
+  const handleMirrorSide = useCallback(
+    (sourceSide: 'left' | 'right') => {
+      handleMirrorHalf(sourceSide === 'left' ? 'left-to-right' : 'right-to-left');
+    },
+    [handleMirrorHalf]
+  );
+
+  // Reflect all strokes across the active reflection axis
+  const handleReflectAllStrokes = useCallback(
+    (type?: ReflectionType) => {
+      if (currentStrokes.length === 0) return;
+      const refType = type || reflectionSettings.type;
+      setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+      setRedoStack([]);
+      const reflected = reflectStrokes(currentStrokes, reflectionAxisX, reflectionAxisY, refType);
+      const combined = [...currentStrokes, ...reflected];
+      updateActiveStrokes(combined);
+      setBeautifyNotice(`Reflected all strokes (${refType} reflection, ${reflected.length} added)`);
+      if (onRecordHistory) {
+        onRecordHistory(`Reflected all strokes (${refType}) on '${currentChar}'`);
+      }
+      setTimeout(() => setBeautifyNotice(null), 2500);
+    },
+    [currentStrokes, reflectionSettings.type, reflectionAxisX, reflectionAxisY, updateActiveStrokes, onRecordHistory, currentChar]
+  );
+
+  // Apply Ramer-Douglas-Peucker simplification to decimate control points while maintaining shape
+  const handleApplySimplification = useCallback(
+    (targetEpsilon?: number) => {
+      if (currentStrokes.length === 0) return;
+      const eps = targetEpsilon !== undefined ? targetEpsilon : simplifySettings.epsilon;
+      setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+      setRedoStack([]);
+      const result = simplifyGlyphStrokes(
+        currentStrokes,
+        eps,
+        simplifySettings.curveRelaxation
+      );
+      updateActiveStrokes(result.strokes);
+      if (onRecordHistory) {
+        onRecordHistory(
+          `Simplify paths (RDP ε=${eps}px) on '${currentChar}': -${result.metrics.reductionPercentage}% points`
+        );
+      }
+      setBeautifyNotice(
+        `Simplified '${currentChar}' paths: ${result.metrics.originalPointCount} ➔ ${result.metrics.simplifiedPointCount} pts (-${result.metrics.reductionPercentage}%) [RDP ε=${eps}px]`
+      );
+      setTimeout(() => setBeautifyNotice(null), 3000);
+    },
+    [currentStrokes, simplifySettings.epsilon, simplifySettings.curveRelaxation, updateActiveStrokes, onRecordHistory, currentChar]
+  );
+
+  // Batch simplify all glyphs in the entire font dictionary using Ramer-Douglas-Peucker
+  const handleBatchSimplifyAll = useCallback(() => {
+    setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+    setRedoStack([]);
+    const res = batchSimplifyAllGlyphs(
+      glyphs,
+      simplifySettings.epsilon,
+      simplifySettings.curveRelaxation
+    );
+    if (onUpdateAllGlyphs) {
+      onUpdateAllGlyphs(res.glyphs);
+    }
+    if (onRecordHistory) {
+      onRecordHistory(
+        `Batch simplified ${res.modifiedGlyphCount} characters: reduced ${res.totalReducedPoints} pts (-${res.overallReductionPercentage}%)`
+      );
+    }
+    setBeautifyNotice(
+      `Batch simplified ${res.modifiedGlyphCount} characters: reduced ${res.totalReducedPoints} points (-${res.overallReductionPercentage}%)!`
+    );
+    setTimeout(() => setBeautifyNotice(null), 3500);
+  }, [glyphs, simplifySettings.epsilon, simplifySettings.curveRelaxation, onUpdateAllGlyphs, onRecordHistory, currentStrokes]);
 
   // Center glyph strokes horizontally and vertically within the font's metric boundaries
   const handleCenterGlyph = useCallback(
@@ -1058,6 +1242,51 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     setTimeout(() => setBeautifyNotice(null), 2500);
   }, [currentStrokes, currentChar, updateActiveStrokes, onRecordHistory]);
 
+  // One-click Snap: align all stroke endpoints (or all points) of the active character to the configured grid
+  const handleSnapGlyphEndpoints = useCallback(() => {
+    if (currentStrokes.length === 0) return;
+    setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+    setRedoStack([]);
+    const res = snapGlyphStrokesEndpoints(
+      currentStrokes,
+      gridSettings.gridSize,
+      gridSettings.magneticThreshold,
+      gridSettings.snapEndpointsOnly
+    );
+    updateActiveStrokes(res.strokes);
+    if (onRecordHistory) {
+      onRecordHistory(
+        `Snapped ${res.snappedEndpointsCount} endpoints to ${gridSettings.gridSize}px grid on '${currentChar}'`
+      );
+    }
+    setBeautifyNotice(
+      `Aligned ${res.snappedEndpointsCount}/${res.totalEndpoints} endpoints to ${gridSettings.gridSize}px grid [X]`
+    );
+    setTimeout(() => setBeautifyNotice(null), 2500);
+  }, [currentStrokes, gridSettings, currentChar, updateActiveStrokes, onRecordHistory]);
+
+  // Match Font Average Weight: normalize current character's pressure to harmonize with font-wide average
+  const handleMatchFontAverageWeight = useCallback(() => {
+    if (currentStrokes.length === 0 || crossCharWeightMetrics.fontAvgPressure <= 0) return;
+    setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
+    setRedoStack([]);
+    const balanced = balanceStrokesPressure(currentStrokes, {
+      targetAverage: crossCharWeightMetrics.fontAvgPressure,
+      smoothRadius: 3,
+      contrastBoost: 1.0,
+    });
+    updateActiveStrokes(balanced);
+    if (onRecordHistory) {
+      onRecordHistory(
+        `Harmonized line weight on '${currentChar}' to font average (${crossCharWeightMetrics.fontAvgThickness}px)`
+      );
+    }
+    setBeautifyNotice(
+      `Harmonized '${currentChar}' to font average line weight (${crossCharWeightMetrics.fontAvgThickness}px)`
+    );
+    setTimeout(() => setBeautifyNotice(null), 2500);
+  }, [currentStrokes, crossCharWeightMetrics, currentChar, updateActiveStrokes, onRecordHistory]);
+
   // Redraw canvas on state changes
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1094,6 +1323,16 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       ctx.moveTo(0, y);
       ctx.lineTo(CANVAS_SIZE, y);
       ctx.stroke();
+    }
+
+    // Snap to Grid: geometric alignment grid lines, vertex dots, and magnetic snapping halo
+    if (gridSettings.showGridLines || gridSettings.enabled) {
+      drawCanvasGridOverlay(ctx, gridSettings.gridSize, {
+        hoverPt: hoverCanvasPt,
+        magneticThreshold: gridSettings.enabled ? gridSettings.magneticThreshold : 0,
+        showIntersectionDots: gridSettings.showIntersectionDots,
+        majorGridEvery: gridSettings.majorGridEvery,
+      });
     }
 
     // Underlay reference image for direct manual tracing
@@ -1472,6 +1711,7 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         showTremorWarnings: showPressureTremorWarnings,
         thicknessScale: pressureThicknessScale,
         renderThicknessEnvelopes: true,
+        liveCursorPt: hoverCanvasPt,
       });
     }
 
@@ -1581,114 +1821,56 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     }
 
     // -------------------------------------------------------------
-    // Symmetry Guide: Vertical Center Axis, Markers & Ghost Mirror Reticle
+    // Reflection Tool: Vertical & Horizontal Axis Reflection Overlay
     // -------------------------------------------------------------
-    if (symmetryEnabled) {
-      ctx.save();
-      const axisX = effectiveSymmetryAxisX;
+    if (reflectionSettings.enabled) {
+      drawReflectionCanvasOverlay(
+        ctx,
+        reflectionAxisX,
+        reflectionAxisY,
+        reflectionSettings,
+        {
+          hoverPt: hoverCanvasPt,
+          drawingMode,
+          baseWidth: penSettings.baseWidth,
+          width: CANVAS_SIZE,
+          height: CANVAS_SIZE,
+        }
+      );
 
-      // 1. Soft glowing background band for the symmetry line
-      ctx.fillStyle = 'rgba(99, 102, 241, 0.08)';
-      ctx.fillRect(axisX - 14, 30, 28, CANVAS_SIZE - 60);
-
-      // 2. Vertical symmetry axis dashed line
-      ctx.strokeStyle = '#6366f1'; // Indigo 500
-      ctx.lineWidth = 1.8;
-      ctx.setLineDash([6, 5]);
-      ctx.beginPath();
-      ctx.moveTo(axisX, 30);
-      ctx.lineTo(axisX, CANVAS_SIZE - 30);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // 3. Top & Bottom diamond markers
-      const drawDiamond = (cy: number) => {
-        ctx.fillStyle = '#4f46e5';
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        ctx.moveTo(axisX, cy - 7);
-        ctx.lineTo(axisX + 7, cy);
-        ctx.lineTo(axisX, cy + 7);
-        ctx.lineTo(axisX - 7, cy);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-      };
-      drawDiamond(30);
-      drawDiamond(CANVAS_SIZE - 30);
-
-      // 4. Symmetry Axis Badge Callout at top
-      ctx.font = 'bold 9px monospace';
-      ctx.textAlign = 'center';
-      const symLabel = `Symmetry Axis · X: ${axisX}px (${symmetryAxisMode === 'metric' ? 'Metric' : 'Canvas'})`;
-      const symTextMetrics = ctx.measureText(symLabel);
-      const symTextW = symTextMetrics.width;
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-      ctx.beginPath();
-      ctx.roundRect(axisX - symTextW / 2 - 8, 12, symTextW + 16, 17, 4);
-      ctx.fill();
-      ctx.fillStyle = '#e0e7ff';
-      ctx.fillText(symLabel, axisX, 24);
-
-      // 5. Mirrored eraser reticle when eraser mode is active
+      // Mirrored eraser reticle when eraser mode is active
       if (drawingMode === 'eraser' && eraserCursor && eraserCursor.visible) {
-        const mirrorEraserX = Math.round(2 * axisX - eraserCursor.x);
+        ctx.save();
+        const mirroredPoints = reflectPoint(
+          eraserCursor,
+          reflectionAxisX,
+          reflectionAxisY,
+          reflectionSettings.type
+        );
         const isSegment = eraserSubMode === 'segment';
         ctx.strokeStyle = isSegment ? '#f43f5e' : '#f97316';
         ctx.fillStyle = isSegment ? 'rgba(244, 63, 94, 0.12)' : 'rgba(249, 115, 22, 0.15)';
         ctx.lineWidth = 1.5;
         ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        ctx.arc(mirrorEraserX, eraserCursor.y, eraserRadius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-        ctx.setLineDash([]);
+
+        for (const mPt of mirroredPoints) {
+          ctx.beginPath();
+          ctx.arc(mPt.x, mPt.y, eraserRadius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+        ctx.restore();
       }
+    }
 
-      // 6. Real-time Ghost Mirror Reticle when hovering pen
-      if (hoverCanvasPt && drawingMode === 'pen') {
-        const mirrorHoverX = Math.round(2 * axisX - hoverCanvasPt.x);
-        const mirrorHoverY = hoverCanvasPt.y;
-
-        // Connecting hairline between cursor and mirror reticle
-        ctx.strokeStyle = 'rgba(99, 102, 241, 0.35)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(hoverCanvasPt.x, hoverCanvasPt.y);
-        ctx.lineTo(mirrorHoverX, mirrorHoverY);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Ghost mirror reticle ring
-        const reticleR = Math.max(4, penSettings.baseWidth / 2);
-        ctx.strokeStyle = '#6366f1';
-        ctx.fillStyle = 'rgba(99, 102, 241, 0.18)';
-        ctx.lineWidth = 1.8;
-        ctx.beginPath();
-        ctx.arc(mirrorHoverX, mirrorHoverY, reticleR, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-
-        // Center dot
-        ctx.fillStyle = '#4f46e5';
-        ctx.beginPath();
-        ctx.arc(mirrorHoverX, mirrorHoverY, 2.5, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Mirror label badge
-        ctx.fillStyle = 'rgba(79, 70, 229, 0.9)';
-        ctx.beginPath();
-        ctx.roundRect(mirrorHoverX + 8, mirrorHoverY - 14, 42, 14, 3);
-        ctx.fill();
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 8px monospace';
-        ctx.textAlign = 'left';
-        ctx.fillText('MIRROR', mirrorHoverX + 11, mirrorHoverY - 4);
-      }
-
-      ctx.restore();
+    // -------------------------------------------------------------
+    // Simplify Paths: Ramer-Douglas-Peucker (RDP) Vector Node Overlay
+    // -------------------------------------------------------------
+    if (
+      (simplifySettings.enabled || showSimplifyPanel || simplifySettings.showControlPoints) &&
+      currentStrokes.length > 0
+    ) {
+      drawSimplifyCanvasOverlay(ctx, currentStrokes, simplifySettings);
     }
 
     if (charRotation !== 0) {
@@ -1755,10 +1937,13 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     showBoundingBox,
     currentBBox,
     isFocusMode,
-    symmetryEnabled,
-    symmetryAxisMode,
-    effectiveSymmetryAxisX,
+    reflectionSettings,
+    reflectionAxisX,
+    reflectionAxisY,
     hoverCanvasPt,
+    gridSettings,
+    simplifySettings,
+    showSimplifyPanel,
   ]);
 
   // Load underlay image into underlayImgRef whenever underlay.src changes
@@ -1834,15 +2019,22 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             ? eraseStrokeSegments(currentStrokes, pt.x, pt.y, eraserRadius)
             : eraseWholeStrokesAtPoint(currentStrokes, pt.x, pt.y, eraserRadius);
 
-        // Also erase mirrored side if symmetry guide is enabled
-        if (symmetryEnabled) {
-          const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
-          const symResult =
-            eraserSubMode === 'segment'
-              ? eraseStrokeSegments(result.strokes, mirrorX, pt.y, eraserRadius)
-              : eraseWholeStrokesAtPoint(result.strokes, mirrorX, pt.y, eraserRadius);
-          if (symResult.changed) {
-            result = { strokes: symResult.strokes, changed: true };
+        // Also erase mirrored points across reflection axes if reflection tool is enabled
+        if (reflectionSettings.enabled) {
+          const mirroredPts = reflectPoint(
+            pt,
+            reflectionAxisX,
+            reflectionAxisY,
+            reflectionSettings.type
+          );
+          for (const mPt of mirroredPts) {
+            const symResult =
+              eraserSubMode === 'segment'
+                ? eraseStrokeSegments(result.strokes, mPt.x, mPt.y, eraserRadius)
+                : eraseWholeStrokesAtPoint(result.strokes, mPt.x, mPt.y, eraserRadius);
+            if (symResult.changed) {
+              result = { strokes: symResult.strokes, changed: true };
+            }
           }
         }
 
@@ -1863,22 +2055,42 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       return;
     }
 
-    // Pen mode: Entry taper
+    // Pen mode: Entry taper & start point grid snapping
+    let drawPt: { x: number; y: number; pressure: number } = pt;
+    if (gridSettings.enabled) {
+      const snapRes = snapPointToGrid(pt, gridSettings.gridSize, gridSettings.magneticThreshold);
+      if (snapRes.snapped) {
+        drawPt = {
+          x: snapRes.point.x,
+          y: snapRes.point.y,
+          pressure: snapRes.point.pressure ?? pt.pressure,
+        };
+      }
+    }
+
     if (penSettings.pressureSensitivity && e.pointerType !== 'pen') {
-      pt.pressure = 0.65;
+      drawPt.pressure = 0.65;
     }
     // Save deep-cloned state to undo stack before stroke begins
     setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
     setRedoStack([]);
 
-    if (symmetryEnabled) {
-      const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
-      const mirrorPt = { x: mirrorX, y: pt.y, pressure: pt.pressure };
-      // Push both primary stroke and mirrored stroke in tandem
-      const newStrokes = [...currentStrokes, [pt], [mirrorPt]];
+    if (reflectionSettings.enabled) {
+      const mirroredPts = reflectPoint(
+        drawPt,
+        reflectionAxisX,
+        reflectionAxisY,
+        reflectionSettings.type
+      );
+      // Push primary stroke and all mirrored strokes in tandem
+      const newStrokes = [
+        ...currentStrokes,
+        [drawPt],
+        ...mirroredPts.map((mPt) => [{ x: mPt.x, y: mPt.y, pressure: mPt.pressure ?? drawPt.pressure }]),
+      ];
       updateActiveStrokes(newStrokes);
     } else {
-      const newStrokes = [...currentStrokes, [pt]];
+      const newStrokes = [...currentStrokes, [drawPt]];
       updateActiveStrokes(newStrokes);
     }
   };
@@ -1911,32 +2123,54 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
             result = eraseStrokeSegments(currentStrokes, pt.x, pt.y, eraserRadius);
           }
 
-          if (symmetryEnabled) {
-            const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
-            const prevMirrorX = prevEraserPosRef.current
-              ? Math.round(2 * effectiveSymmetryAxisX - prevEraserPosRef.current.x)
-              : mirrorX;
-            const symResult = prevEraserPosRef.current
-              ? eraseStrokeSegmentsAlongPath(
-                  result.strokes,
-                  prevMirrorX,
-                  prevEraserPosRef.current.y,
-                  mirrorX,
-                  pt.y,
-                  eraserRadius
+          if (reflectionSettings.enabled) {
+            const mirroredPts = reflectPoint(
+              pt,
+              reflectionAxisX,
+              reflectionAxisY,
+              reflectionSettings.type
+            );
+            const prevMirroredPts = prevEraserPosRef.current
+              ? reflectPoint(
+                  prevEraserPosRef.current,
+                  reflectionAxisX,
+                  reflectionAxisY,
+                  reflectionSettings.type
                 )
-              : eraseStrokeSegments(result.strokes, mirrorX, pt.y, eraserRadius);
-            if (symResult.changed) {
-              result = { strokes: symResult.strokes, changed: true };
+              : mirroredPts;
+
+            for (let i = 0; i < mirroredPts.length; i++) {
+              const mPt = mirroredPts[i];
+              const pMPt = prevMirroredPts[i] || mPt;
+              const symResult = prevEraserPosRef.current
+                ? eraseStrokeSegmentsAlongPath(
+                    result.strokes,
+                    pMPt.x,
+                    pMPt.y,
+                    mPt.x,
+                    mPt.y,
+                    eraserRadius
+                  )
+                : eraseStrokeSegments(result.strokes, mPt.x, mPt.y, eraserRadius);
+              if (symResult.changed) {
+                result = { strokes: symResult.strokes, changed: true };
+              }
             }
           }
         } else {
           result = eraseWholeStrokesAtPoint(currentStrokes, pt.x, pt.y, eraserRadius);
-          if (symmetryEnabled) {
-            const mirrorX = Math.round(2 * effectiveSymmetryAxisX - pt.x);
-            const symResult = eraseWholeStrokesAtPoint(result.strokes, mirrorX, pt.y, eraserRadius);
-            if (symResult.changed) {
-              result = { strokes: symResult.strokes, changed: true };
+          if (reflectionSettings.enabled) {
+            const mirroredPts = reflectPoint(
+              pt,
+              reflectionAxisX,
+              reflectionAxisY,
+              reflectionSettings.type
+            );
+            for (const mPt of mirroredPts) {
+              const symResult = eraseWholeStrokesAtPoint(result.strokes, mPt.x, mPt.y, eraserRadius);
+              if (symResult.changed) {
+                result = { strokes: symResult.strokes, changed: true };
+              }
             }
           }
         }
@@ -1966,10 +2200,13 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     const strokes = [...currentStrokes];
     if (strokes.length === 0) return;
 
-    if (symmetryEnabled) {
-      if (strokes.length < 2) return;
-      const primaryStroke = [...strokes[strokes.length - 2]];
-      const mirrorStroke = [...strokes[strokes.length - 1]];
+    if (reflectionSettings.enabled) {
+      const mirroredCount = reflectionSettings.type === 'quad' ? 3 : 1;
+      const totalGroup = 1 + mirroredCount;
+      if (strokes.length < totalGroup) return;
+
+      const priIdx = strokes.length - totalGroup;
+      const primaryStroke = [...strokes[priIdx]];
       const lastPt = primaryStroke[primaryStroke.length - 1];
       if (!lastPt) return;
 
@@ -1992,17 +2229,21 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       const stabilizedPt = stabilizePointRealtime(pt, lastPt, smoothingVal);
       if (!stabilizedPt) return;
 
-      const mirrorPt = {
-        x: Math.round(2 * effectiveSymmetryAxisX - stabilizedPt.x),
-        y: stabilizedPt.y,
-        pressure: stabilizedPt.pressure,
-      };
-
       primaryStroke.push(stabilizedPt);
-      mirrorStroke.push(mirrorPt);
+      strokes[priIdx] = primaryStroke;
 
-      strokes[strokes.length - 2] = primaryStroke;
-      strokes[strokes.length - 1] = mirrorStroke;
+      const mirroredPts = reflectPoint(
+        stabilizedPt,
+        reflectionAxisX,
+        reflectionAxisY,
+        reflectionSettings.type
+      );
+      mirroredPts.forEach((mPt, idx) => {
+        const mStroke = [...strokes[priIdx + 1 + idx]];
+        mStroke.push(mPt);
+        strokes[priIdx + 1 + idx] = mStroke;
+      });
+
       updateActiveStrokes(strokes);
       return;
     }
@@ -2047,25 +2288,127 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     if (drawingMode === 'pen' && smoothingVal >= 0.15 && currentStrokes.length > 0) {
       const strokes = [...currentStrokes];
 
-      if (symmetryEnabled && strokes.length >= 2) {
-        const primaryStroke = strokes[strokes.length - 2];
-        if (primaryStroke && primaryStroke.length >= 3) {
-          const finalizedPrimary = finalizeStrokeWithSmoothing(primaryStroke, smoothingVal);
-          // Mirror finalized primary curve points to preserve 100% mathematical symmetry
-          const finalizedMirror = finalizedPrimary.map((p) => ({
-            x: Math.round(2 * effectiveSymmetryAxisX - p.x),
-            y: p.y,
-            pressure: p.pressure,
-          }));
-          strokes[strokes.length - 2] = finalizedPrimary;
-          strokes[strokes.length - 1] = finalizedMirror;
-          updateActiveStrokes(strokes);
+      if (reflectionSettings.enabled) {
+        const mirroredCount = reflectionSettings.type === 'quad' ? 3 : 1;
+        const totalGroup = 1 + mirroredCount;
+        if (strokes.length >= totalGroup) {
+          const priIdx = strokes.length - totalGroup;
+          const primaryStroke = strokes[priIdx];
+          if (primaryStroke && primaryStroke.length >= 3) {
+            const finalizedPrimary = finalizeStrokeWithSmoothing(primaryStroke, smoothingVal);
+            strokes[priIdx] = finalizedPrimary;
+            // Mirror finalized primary curve points to preserve 100% mathematical symmetry
+            const mirroredStrokes = reflectStroke(
+              finalizedPrimary,
+              reflectionAxisX,
+              reflectionAxisY,
+              reflectionSettings.type
+            );
+            mirroredStrokes.forEach((mStroke, idx) => {
+              strokes[priIdx + 1 + idx] = mStroke;
+            });
+            updateActiveStrokes(strokes);
+          }
         }
       } else {
         const activeStroke = strokes[strokes.length - 1];
         if (activeStroke && activeStroke.length >= 3) {
           const finalized = finalizeStrokeWithSmoothing(activeStroke, smoothingVal);
           strokes[strokes.length - 1] = finalized;
+          updateActiveStrokes(strokes);
+        }
+      }
+    }
+
+    // Snap stroke endpoint to grid if Snap to Grid is enabled
+    if (gridSettings.enabled && drawingMode === 'pen' && currentStrokes.length > 0) {
+      const strokes = [...currentStrokes];
+      if (reflectionSettings.enabled) {
+        const mirroredCount = reflectionSettings.type === 'quad' ? 3 : 1;
+        const totalGroup = 1 + mirroredCount;
+        if (strokes.length >= totalGroup) {
+          const priIdx = strokes.length - totalGroup;
+          const priStroke = [...strokes[priIdx]];
+          if (priStroke.length > 0) {
+            const lastPt = priStroke[priStroke.length - 1];
+            const snapRes = snapPointToGrid(lastPt, gridSettings.gridSize, gridSettings.magneticThreshold);
+            if (snapRes.snapped) {
+              priStroke[priStroke.length - 1] = {
+                x: snapRes.point.x,
+                y: snapRes.point.y,
+                pressure: snapRes.point.pressure ?? lastPt.pressure,
+              };
+              strokes[priIdx] = priStroke;
+              const mirroredStrokes = reflectStroke(
+                priStroke,
+                reflectionAxisX,
+                reflectionAxisY,
+                reflectionSettings.type
+              );
+              mirroredStrokes.forEach((mStroke, idx) => {
+                strokes[priIdx + 1 + idx] = mStroke;
+              });
+              updateActiveStrokes(strokes);
+            }
+          }
+        }
+      } else {
+        const actIdx = strokes.length - 1;
+        const actStroke = [...strokes[actIdx]];
+        if (actStroke.length > 0) {
+          const lastPt = actStroke[actStroke.length - 1];
+          const snapRes = snapPointToGrid(lastPt, gridSettings.gridSize, gridSettings.magneticThreshold);
+          if (snapRes.snapped) {
+            actStroke[actStroke.length - 1] = {
+              x: snapRes.point.x,
+              y: snapRes.point.y,
+              pressure: snapRes.point.pressure ?? lastPt.pressure,
+            };
+            strokes[actIdx] = actStroke;
+            updateActiveStrokes(strokes);
+          }
+        }
+      }
+    }
+
+    // Auto-Simplify on Draw: apply Ramer-Douglas-Peucker immediately to newly drawn strokes
+    if (simplifySettings.autoSimplifyOnDraw && drawingMode === 'pen' && currentStrokes.length > 0) {
+      const strokes = [...currentStrokes];
+      if (reflectionSettings.enabled) {
+        const mirroredCount = reflectionSettings.type === 'quad' ? 3 : 1;
+        const totalGroup = 1 + mirroredCount;
+        if (strokes.length >= totalGroup) {
+          const priIdx = strokes.length - totalGroup;
+          const priStroke = strokes[priIdx];
+          if (priStroke && priStroke.length > 2) {
+            const simplifiedPri = simplifyStroke(
+              priStroke,
+              simplifySettings.epsilon,
+              simplifySettings.curveRelaxation
+            );
+            strokes[priIdx] = simplifiedPri;
+            const mirroredStrokes = reflectStroke(
+              simplifiedPri,
+              reflectionAxisX,
+              reflectionAxisY,
+              reflectionSettings.type
+            );
+            mirroredStrokes.forEach((mStroke, idx) => {
+              strokes[priIdx + 1 + idx] = mStroke;
+            });
+            updateActiveStrokes(strokes);
+          }
+        }
+      } else {
+        const actIdx = strokes.length - 1;
+        const actStroke = strokes[actIdx];
+        if (actStroke && actStroke.length > 2) {
+          const simplified = simplifyStroke(
+            actStroke,
+            simplifySettings.epsilon,
+            simplifySettings.curveRelaxation
+          );
+          strokes[actIdx] = simplified;
           updateActiveStrokes(strokes);
         }
       }
@@ -2089,14 +2432,21 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
     if (currentStrokes.length === 0) return;
     setUndoStack((prev) => [...prev.slice(-49), cloneGlyphStrokes(currentStrokes)]);
     setRedoStack([]);
-    const countToDelete = symmetryEnabled && currentStrokes.length >= 2 ? 2 : 1;
-    const updated = currentStrokes.slice(0, -countToDelete);
+    const countToDelete = reflectionSettings.enabled
+      ? (reflectionSettings.type === 'quad' ? 4 : 2)
+      : 1;
+    const effectiveCount = Math.min(countToDelete, currentStrokes.length);
+    const updated = currentStrokes.slice(0, -effectiveCount);
     updateActiveStrokes(updated);
     setBeautifyNotice(
-      `Deleted ${countToDelete === 2 ? 'mirrored stroke pair' : 'stroke'} (${updated.length} left). Revert with Undo [Ctrl+Z].`
+      `Deleted ${
+        effectiveCount > 1
+          ? `mirrored stroke group (${effectiveCount} strokes)`
+          : 'stroke'
+      } (${updated.length} left). Revert with Undo [Ctrl+Z].`
     );
     setTimeout(() => setBeautifyNotice(null), 2500);
-  }, [currentStrokes, updateActiveStrokes, symmetryEnabled]);
+  }, [currentStrokes, updateActiveStrokes, reflectionSettings.enabled, reflectionSettings.type]);
 
   const handleClear = () => {
     if (currentStrokes.length === 0) return;
@@ -2214,15 +2564,74 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
         return;
       }
 
-      // S: Toggle Symmetry Guide (horizontal mirroring across center axis)
+      // S: Toggle Reflection Tool (horizontal, vertical, or quad 4-way mirroring)
+      // Shift+S: Cycle reflection mode (horizontal -> vertical -> quad)
       if ((e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
-        setSymmetryEnabled((prev) => {
+        if (e.shiftKey) {
+          setReflectionSettings((prev) => {
+            const nextType: ReflectionType =
+              prev.type === 'horizontal'
+                ? 'vertical'
+                : prev.type === 'vertical'
+                ? 'quad'
+                : 'horizontal';
+            const typeLabel =
+              nextType === 'horizontal'
+                ? 'Horizontal (Left ↔ Right)'
+                : nextType === 'vertical'
+                ? 'Vertical (Top ↕ Bottom)'
+                : 'Quad 4-Way (Dual Axes)';
+            setBeautifyNotice(`Reflection Mode: ${typeLabel} [Shift+S]`);
+            setTimeout(() => setBeautifyNotice(null), 2500);
+            return { ...prev, type: nextType, enabled: true };
+          });
+        } else {
+          setReflectionSettings((prev) => {
+            const next = !prev.enabled;
+            const typeLabel =
+              prev.type === 'horizontal'
+                ? `Horizontal (X=${reflectionAxisX}px)`
+                : prev.type === 'vertical'
+                ? `Vertical (Y=${reflectionAxisY}px)`
+                : `Quad 4-Way (X=${reflectionAxisX}px, Y=${reflectionAxisY}px)`;
+            setBeautifyNotice(
+              next
+                ? `Reflection Tool ON: ${typeLabel} [S]`
+                : 'Reflection Tool OFF [S]'
+            );
+            setTimeout(() => setBeautifyNotice(null), 2500);
+            return { ...prev, enabled: next };
+          });
+        }
+        return;
+      }
+
+      // X: Toggle Snap to Grid (endpoint alignment)
+      if ((e.key === 'x' || e.key === 'X') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setGridSettings((prev) => {
+          const next = !prev.enabled;
+          setBeautifyNotice(
+            next
+              ? `Snap to Grid ON: aligning stroke endpoints to ${prev.gridSize}px pitch [X]`
+              : 'Snap to Grid OFF'
+          );
+          setTimeout(() => setBeautifyNotice(null), 2000);
+          return { ...prev, enabled: next };
+        });
+        return;
+      }
+
+      // Y: Toggle Simplify Paths (Ramer-Douglas-Peucker) tool panel
+      if ((e.key === 'y' || e.key === 'Y') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setShowSimplifyPanel((prev) => {
           const next = !prev;
           setBeautifyNotice(
             next
-              ? `Symmetry Guide ON: horizontal mirroring active at X=${effectiveSymmetryAxisX}px [S]`
-              : 'Symmetry Guide OFF'
+              ? `Simplify Paths (RDP ε=${simplifySettings.epsilon}px) Inspector Open [Y]`
+              : 'Simplify Paths Inspector Closed'
           );
           setTimeout(() => setBeautifyNotice(null), 2000);
           return next;
@@ -2235,9 +2644,31 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
       } else if (e.key === 'ArrowRight') {
         goToNext();
       } else if (e.key === 't' || e.key === 'T') {
-        // Toggle tracing guide overlay
+        // Toggle Ghost Template (standard Latin tracing guide) overlay
         e.preventDefault();
-        setTracingGuide((prev) => ({ ...prev, enabled: !prev.enabled }));
+        if (e.shiftKey) {
+          setShowTracingGuidePanel((prev) => {
+            const next = !prev;
+            setBeautifyNotice(
+              next
+                ? `Ghost Template Inspector Open [Shift+T]`
+                : 'Ghost Template Inspector Closed'
+            );
+            setTimeout(() => setBeautifyNotice(null), 2000);
+            return next;
+          });
+        } else {
+          setTracingGuide((prev) => {
+            const next = !prev.enabled;
+            setBeautifyNotice(
+              next
+                ? `Ghost Template ON: Tracing '${currentChar}' standard Latin guide [T]`
+                : 'Ghost Template OFF [T]'
+            );
+            setTimeout(() => setBeautifyNotice(null), 2000);
+            return { ...prev, enabled: next };
+          });
+        }
       } else if (e.key === 'g' || e.key === 'G') {
         // Toggle Ghost Path preview of previous character's baseline & height
         e.preventDefault();
@@ -2905,18 +3336,48 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               <span>Width Indicators</span>
             </button>
 
-            <button
-              onClick={() => setTracingGuide((prev) => ({ ...prev, enabled: !prev.enabled }))}
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                tracingGuide.enabled
-                  ? 'bg-sky-50 border border-sky-300 text-sky-800 shadow-2xs'
-                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
-              }`}
-              title="Toggle ghosted standard form Tracing Guide for character proportions [T]"
-            >
-              <Compass className="w-3.5 h-3.5 text-sky-600" />
-              <span>Tracing Guide {tracingGuide.enabled ? 'ON' : 'OFF'}</span>
-            </button>
+            {/* Ghost Template (Standard Latin Tracing Guide) Control */}
+            <div className="flex items-center rounded-lg border border-sky-300 overflow-hidden shadow-2xs bg-white">
+              <button
+                onClick={() => {
+                  setTracingGuide((prev) => {
+                    const next = !prev.enabled;
+                    setBeautifyNotice(
+                      next
+                        ? `Ghost Template ON: Tracing '${currentChar}' standard Latin form [T]`
+                        : 'Ghost Template OFF [T]'
+                    );
+                    setTimeout(() => setBeautifyNotice(null), 2000);
+                    return { ...prev, enabled: next };
+                  });
+                }}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                  tracingGuide.enabled
+                    ? 'bg-sky-600 text-white'
+                    : 'bg-white text-slate-700 hover:bg-slate-100'
+                }`}
+                title="Toggle semi-transparent 'ghost' template of standard Latin characters for manual handwriting tracing [T]"
+              >
+                <Ghost className="w-3.5 h-3.5" />
+                <span>Ghost Template {tracingGuide.enabled ? 'ON' : 'OFF'} [T]</span>
+                {tracingGuide.enabled && (
+                  <span className="ml-0.5 px-1.5 py-0.2 rounded bg-sky-800 text-white text-[10px] font-mono font-bold">
+                    {Math.round(tracingGuide.opacity * 100)}%
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setShowTracingGuidePanel((prev) => !prev)}
+                className={`px-2 py-1.5 text-xs transition-colors border-l border-sky-300 ${
+                  showTracingGuidePanel
+                    ? 'bg-sky-700 text-white'
+                    : 'bg-sky-50 text-sky-700 hover:bg-sky-100'
+                }`}
+                title="Open Ghost Template Settings & Latin Tracing HUD [Shift+T]"
+              >
+                <Sliders className="w-3.5 h-3.5" />
+              </button>
+            </div>
 
             {/* Background Reference Image Tracing Import & Toggle */}
             {!underlay.src ? (
@@ -3114,41 +3575,130 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               </button>
             </div>
 
-            {/* Symmetry Guide Mirroring Tool */}
+            {/* Vertical & Horizontal Reflection Tool */}
             <div className="flex items-center rounded-md border border-slate-200 overflow-hidden bg-white shadow-2xs">
               <button
                 onClick={() => {
-                  setSymmetryEnabled((prev) => {
-                    const next = !prev;
+                  setReflectionSettings((prev) => {
+                    const next = !prev.enabled;
+                    const modeDesc =
+                      prev.type === 'horizontal'
+                        ? 'Horizontal (L ↔ R)'
+                        : prev.type === 'vertical'
+                        ? 'Vertical (T ↕ B)'
+                        : 'Quad 4-Way (Dual Axes)';
                     setBeautifyNotice(
                       next
-                        ? `Symmetry Guide ON: horizontal mirroring active at X=${effectiveSymmetryAxisX}px [S]`
-                        : 'Symmetry Guide OFF'
+                        ? `Reflection Tool ON: ${modeDesc} [S]`
+                        : 'Reflection Tool OFF [S]'
                     );
                     setTimeout(() => setBeautifyNotice(null), 2500);
-                    return next;
+                    return { ...prev, enabled: next };
                   });
                 }}
                 className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold transition-all ${
-                  symmetryEnabled
+                  reflectionSettings.enabled
                     ? 'bg-indigo-600 text-white shadow-2xs'
                     : 'text-slate-700 hover:bg-slate-50'
                 }`}
-                title="Toggle Symmetry Guide [S]: Mirror strokes horizontally across center axis to assist drawing symmetrical characters like 'O' or 'A'"
+                title="Toggle Reflection Tool [S]: Mirror strokes horizontally (vertical axis X), vertically (horizontal axis Y), or quad 4-way across both axes simultaneously"
               >
-                <Split className={`w-3.5 h-3.5 ${symmetryEnabled ? 'text-white' : 'text-indigo-600'}`} />
-                <span>Symmetry {symmetryEnabled ? 'ON' : 'OFF'} [S]</span>
+                <Split className={`w-3.5 h-3.5 ${reflectionSettings.enabled ? 'text-white' : 'text-indigo-600'}`} />
+                <span>Reflection {reflectionSettings.enabled ? 'ON' : 'OFF'} [S]</span>
+                {reflectionSettings.enabled && (
+                  <span className="ml-0.5 px-1.5 py-0.2 rounded bg-indigo-800 text-indigo-100 text-[10px] font-mono font-bold uppercase">
+                    {reflectionSettings.type === 'horizontal'
+                      ? 'H'
+                      : reflectionSettings.type === 'vertical'
+                      ? 'V'
+                      : '4-Way'}
+                  </span>
+                )}
               </button>
               <button
-                onClick={() => setShowSymmetryPanel((prev) => !prev)}
+                onClick={() => setShowReflectionPanel((prev) => !prev)}
                 className={`px-1.5 py-1.5 text-xs transition-colors border-l ${
-                  showSymmetryPanel
+                  showReflectionPanel
                     ? 'bg-indigo-800 text-white border-indigo-700'
-                    : symmetryEnabled
+                    : reflectionSettings.enabled
                     ? 'bg-indigo-700 text-indigo-100 hover:bg-indigo-800 border-indigo-500'
                     : 'text-slate-500 hover:bg-slate-100 border-slate-200'
                 }`}
-                title="Symmetry Guide Settings: Change axis mode (Metric vs Canvas), adjust offset, or use one-click Left/Right mirroring"
+                title="Reflection Tool HUD & Inspector: Switch axis mode (Horizontal ↔, Vertical ↕, Quad ✛), analyze character optical balance, or use one-click half-stroke mirroring"
+              >
+                <Sliders className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Snap to Grid (Endpoint Alignment & Grid Settings) */}
+            <div className="flex items-center rounded-md border border-slate-200 overflow-hidden bg-white shadow-2xs">
+              <button
+                onClick={() => {
+                  setGridSettings((prev) => {
+                    const next = !prev.enabled;
+                    setBeautifyNotice(
+                      next
+                        ? `Snap to Grid ON: aligning stroke endpoints to ${prev.gridSize}px grid [X]`
+                        : 'Snap to Grid OFF'
+                    );
+                    setTimeout(() => setBeautifyNotice(null), 2500);
+                    return { ...prev, enabled: next };
+                  });
+                }}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold transition-all ${
+                  gridSettings.enabled
+                    ? 'bg-indigo-600 text-white shadow-2xs'
+                    : 'text-slate-700 hover:bg-slate-50'
+                }`}
+                title="Toggle Snap to Grid [X]: Automatically aligns stroke endpoints to a configurable grid for clean geometric alignment"
+              >
+                <Magnet className={`w-3.5 h-3.5 ${gridSettings.enabled ? 'text-white' : 'text-indigo-600'}`} />
+                <span>Snap to Grid {gridSettings.enabled ? 'ON' : 'OFF'} [X]</span>
+                {gridSettings.enabled && currentStrokes.length > 0 && (
+                  <span className="ml-0.5 px-1.5 py-0.2 rounded bg-indigo-800 text-indigo-100 text-[10px] font-mono font-bold">
+                    {gridAlignmentMetrics.alignmentPercentage}%
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setShowGridConfigPanel((prev) => !prev)}
+                className={`px-1.5 py-1.5 text-xs transition-colors border-l ${
+                  showGridConfigPanel
+                    ? 'bg-indigo-800 text-white border-indigo-700'
+                    : gridSettings.enabled
+                    ? 'bg-indigo-700 text-indigo-100 hover:bg-indigo-800 border-indigo-500'
+                    : 'text-slate-500 hover:bg-slate-100 border-slate-200'
+                }`}
+                title="Grid Settings: Configure pitch (10/20/40/50px), magnetic snap radius, or snap current glyph endpoints"
+              >
+                <Sliders className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Simplify Paths (Ramer-Douglas-Peucker Algorithm) */}
+            <div className="flex items-center rounded-md border border-emerald-300 overflow-hidden bg-white shadow-2xs">
+              <button
+                onClick={() => handleApplySimplification()}
+                disabled={currentStrokes.length === 0}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
+                title={`Simplify Paths (Ramer-Douglas-Peucker ε=${simplifySettings.epsilon}px) [Y]: Decimates control points to clean up shaky handwriting`}
+              >
+                <Scissors className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Simplify [Y]</span>
+                {currentStrokes.length > 0 && simplificationMetrics.reductionPercentage > 0 && (
+                  <span className="ml-0.5 px-1.5 py-0.2 rounded bg-emerald-700 text-white text-[10px] font-mono font-bold">
+                    -{simplificationMetrics.reductionPercentage}%
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setShowSimplifyPanel((prev) => !prev)}
+                className={`px-1.5 py-1.5 text-xs transition-colors border-l ${
+                  showSimplifyPanel
+                    ? 'bg-emerald-800 text-white border-emerald-700'
+                    : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'
+                }`}
+                title="Simplify Paths Settings: Adjust RDP epsilon tolerance, view live vector vertices, or auto-simplify during sketching"
               >
                 <Sliders className="w-3.5 h-3.5" />
               </button>
@@ -3465,6 +4015,28 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
 
                 {!isPressureHUDCollapsed && (
                   <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
+                    {/* Real-time Cursor Line-Weight Readout Badge */}
+                    <div className="flex items-center justify-between bg-slate-950/80 px-2.5 py-1.5 rounded-lg border border-amber-500/30">
+                      <div className="flex items-center gap-1.5 text-[10px] text-amber-300">
+                        <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                        <span className="font-semibold">Live Cursor Weight:</span>
+                      </div>
+                      <div className="font-mono text-[11px] font-bold text-amber-200">
+                        {hoverCanvasPt
+                          ? `${Math.round(
+                              Math.max(
+                                3,
+                                penSettings.baseWidth *
+                                  (hoverCanvasPt.pressure ?? 1.0) *
+                                  pressureThicknessScale
+                              )
+                            )}px · ${Math.round((hoverCanvasPt.pressure ?? 1.0) * 100)}%`
+                          : `${pressureStats.avgThickness}px · ${Math.round(
+                              pressureStats.avg * 100
+                            )}% (Avg)`}
+                      </div>
+                    </div>
+
                     {/* Penmanship Consistency Score Card */}
                     <div className="bg-slate-800/80 rounded-lg p-2 border border-slate-700/70">
                       <div className="flex items-center justify-between mb-1">
@@ -3731,54 +4303,207 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                         <div className="text-[8px] text-slate-400">{pressureStats.pointCount} pts</div>
                       </div>
                     </div>
+
+                    {/* Cross-Character Line-Weight Distribution Section */}
+                    <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <div className="flex items-center gap-1 font-semibold text-slate-200">
+                          <Gauge className="w-3 h-3 text-indigo-400" />
+                          <span>Cross-Character Weight</span>
+                        </div>
+                        <span
+                          className={`font-mono text-[10px] font-bold px-1.5 py-0.2 rounded border ${
+                            crossCharWeightMetrics.weightCategory === 'Balanced Regular'
+                              ? 'bg-emerald-950/70 text-emerald-300 border-emerald-500/50'
+                              : crossCharWeightMetrics.weightCategory === 'Heavy / Bold'
+                              ? 'bg-rose-950/70 text-rose-300 border-rose-500/50'
+                              : 'bg-amber-950/70 text-amber-300 border-amber-500/50'
+                          }`}
+                        >
+                          {crossCharWeightMetrics.weightDifferencePercent > 0
+                            ? `+${crossCharWeightMetrics.weightDifferencePercent}% heavier`
+                            : crossCharWeightMetrics.weightDifferencePercent < 0
+                            ? `${crossCharWeightMetrics.weightDifferencePercent}% lighter`
+                            : 'Balanced'}
+                        </span>
+                      </div>
+
+                      {/* Active Glyph vs Font Average Comparison Row */}
+                      <div className="grid grid-cols-2 gap-1.5 bg-slate-800/80 p-1.5 rounded-lg border border-slate-700/80 text-[10px]">
+                        <div>
+                          <span className="text-slate-400 text-[9px] block">'{currentChar}' Average:</span>
+                          <span className="font-mono font-bold text-amber-300 text-[11px]">
+                            {crossCharWeightMetrics.currentAvgThickness}px
+                          </span>
+                          <span className="text-slate-400 text-[9px] ml-1">
+                            ({Math.round(crossCharWeightMetrics.currentAvgPressure * 100)}%)
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400 text-[9px] block">Font Average:</span>
+                          <span className="font-mono font-bold text-indigo-300 text-[11px]">
+                            {crossCharWeightMetrics.fontAvgThickness}px
+                          </span>
+                          <span className="text-slate-400 text-[9px] ml-1">
+                            ({Math.round(crossCharWeightMetrics.fontAvgPressure * 100)}%)
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Visual Balance Bar */}
+                      <div className="space-y-0.5">
+                        <div className="flex items-center justify-between text-[9px] font-mono text-slate-400">
+                          <span>Thin (0.5×)</span>
+                          <span className="text-slate-300">Target (1.0×)</span>
+                          <span>Bold (1.5×)</span>
+                        </div>
+                        <div className="h-2 w-full bg-slate-950 rounded-full overflow-hidden p-0.5 border border-slate-700 relative">
+                          {/* 1.0x Target marker */}
+                          <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-white/70 z-10" />
+                          <div
+                            className={`h-full rounded-full transition-all duration-300 ${
+                              Math.abs(crossCharWeightMetrics.weightDifferencePercent) <= 15
+                                ? 'bg-emerald-400'
+                                : crossCharWeightMetrics.weightDifferencePercent > 15
+                                ? 'bg-rose-500'
+                                : 'bg-amber-400'
+                            }`}
+                            style={{
+                              width: `${Math.min(
+                                100,
+                                Math.max(10, ((crossCharWeightMetrics.relativeWeightRatio - 0.5) / 1.0) * 100)
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* One-click Action to Harmonize Weight */}
+                      <button
+                        onClick={handleMatchFontAverageWeight}
+                        disabled={currentStrokes.length === 0 || crossCharWeightMetrics.comparedGlyphCount <= 1}
+                        className="w-full flex items-center justify-center gap-1.5 py-1 px-2 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                        title={`Harmonize '${currentChar}' line-weight to match the ${crossCharWeightMetrics.fontAvgThickness}px font average`}
+                      >
+                        <Sparkles className="w-3 h-3 text-indigo-400" />
+                        <span>Match Font Average ({crossCharWeightMetrics.fontAvgThickness}px)</span>
+                      </button>
+
+                      {/* Cross-Character Thickness Rank Breakdown */}
+                      {crossCharWeightMetrics.charBreakdown.length > 1 && (
+                        <div className="pt-1">
+                          <div className="text-[9px] text-slate-400 font-medium mb-1">
+                            Character Weight Distribution ({crossCharWeightMetrics.charBreakdown.length} glyphs):
+                          </div>
+                          <div className="flex flex-wrap gap-1 max-h-16 overflow-y-auto pr-0.5">
+                            {crossCharWeightMetrics.charBreakdown.slice(0, 8).map((item) => (
+                              <button
+                                key={item.char}
+                                onClick={() => onSelectChar(item.char)}
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold border flex items-center gap-1 transition-all ${
+                                  item.char === currentChar
+                                    ? 'bg-amber-500/30 border-amber-400 text-amber-200 ring-1 ring-amber-400/50'
+                                    : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700'
+                                }`}
+                                title={`Switch to '${item.char}' · ${item.avgThickness}px thickness (${Math.round(
+                                  item.avgPressure * 100
+                                )}% pressure)`}
+                              >
+                                <span className="font-bold font-sans">{item.char}</span>
+                                <span className="text-[8px] text-slate-400">{item.avgThickness}px</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
             )}
 
-            {/* Floating Symmetry Guide HUD / Inspector on Canvas */}
-            {(symmetryEnabled || showSymmetryPanel) && (
+            {/* Floating Reflection Tool HUD & Inspector on Canvas */}
+            {(reflectionSettings.enabled || showReflectionPanel) && (
               <div
                 className={`absolute top-2.5 ${
-                  showPressureHeatmap ? (isPressureHUDCollapsed ? 'left-[215px]' : 'left-[340px]') : 'left-2.5'
+                  showPressureHeatmap
+                    ? isPressureHUDCollapsed
+                      ? 'left-[215px]'
+                      : 'left-[340px]'
+                    : 'left-2.5'
                 } z-20 bg-slate-900/95 backdrop-blur-md border border-indigo-500/50 rounded-xl ${
-                  showSymmetryPanel ? 'p-3 max-w-[310px]' : 'py-1.5 px-3 max-w-fit'
-                } text-white shadow-xl w-full animate-in fade-in slide-in-from-top-1 duration-200 select-none`}
+                  showReflectionPanel ? 'p-3 max-w-[340px]' : 'py-1.5 px-3 max-w-fit'
+                } text-white shadow-xl w-full animate-in fade-in slide-in-from-top-1 duration-200 select-none max-h-[85vh] overflow-y-auto`}
               >
                 {/* Header Row */}
-                <div className={`flex items-center justify-between gap-2.5 ${showSymmetryPanel ? 'mb-2 pb-1.5 border-b border-slate-800' : ''}`}>
+                <div
+                  className={`flex items-center justify-between gap-2.5 ${
+                    showReflectionPanel ? 'mb-2 pb-1.5 border-b border-slate-800' : ''
+                  }`}
+                >
                   <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-300">
                     <Split className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Symmetry {showSymmetryPanel ? 'Guide · Mirror H' : `X: ${effectiveSymmetryAxisX}px`}</span>
+                    <span>
+                      Reflection{' '}
+                      {showReflectionPanel
+                        ? 'Tool · Symmetrical Balance'
+                        : `${
+                            reflectionSettings.type === 'horizontal'
+                              ? `H (X:${reflectionAxisX}px)`
+                              : reflectionSettings.type === 'vertical'
+                              ? `V (Y:${reflectionAxisY}px)`
+                              : `Quad (X:${reflectionAxisX}, Y:${reflectionAxisY})`
+                          }`}
+                    </span>
+                    {reflectionSettings.enabled && (
+                      <span className="px-1.5 py-0.2 rounded bg-indigo-950 border border-indigo-500/60 text-indigo-300 text-[10px] font-mono font-bold uppercase">
+                        {reflectionSettings.type === 'horizontal'
+                          ? 'H'
+                          : reflectionSettings.type === 'vertical'
+                          ? 'V'
+                          : '4-Way'}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-1">
                     <button
-                      onClick={() => setSymmetryEnabled((prev) => !prev)}
+                      onClick={() =>
+                        setReflectionSettings((prev) => {
+                          const next = !prev.enabled;
+                          setBeautifyNotice(
+                            next
+                              ? `Reflection Tool ON: ${prev.type.toUpperCase()} [S]`
+                              : 'Reflection Tool OFF [S]'
+                          );
+                          setTimeout(() => setBeautifyNotice(null), 2000);
+                          return { ...prev, enabled: next };
+                        })
+                      }
                       className={`text-[10px] font-bold px-2 py-0.5 rounded transition-colors ${
-                        symmetryEnabled
+                        reflectionSettings.enabled
                           ? 'bg-indigo-600 text-white shadow-2xs'
                           : 'bg-slate-800 text-slate-300 hover:text-white'
                       }`}
-                      title="Toggle real-time stroke mirroring across center axis [S]"
+                      title="Toggle real-time stroke reflection on canvas [S]"
                     >
-                      {symmetryEnabled ? 'Active [S]' : 'Off [S]'}
+                      {reflectionSettings.enabled ? 'Active [S]' : 'Off [S]'}
                     </button>
                     <button
-                      onClick={() => setShowSymmetryPanel((prev) => !prev)}
+                      onClick={() => setShowReflectionPanel((prev) => !prev)}
                       className={`p-1 rounded text-xs transition-colors ${
-                        showSymmetryPanel
+                        showReflectionPanel
                           ? 'bg-indigo-700 text-white'
                           : 'text-slate-400 hover:text-white hover:bg-slate-800'
                       }`}
-                      title={showSymmetryPanel ? 'Collapse Symmetry Panel' : 'Expand Symmetry Settings'}
+                      title={showReflectionPanel ? 'Collapse Reflection Panel' : 'Expand Reflection Settings'}
                     >
                       <Sliders className="w-3 h-3" />
                     </button>
-                    {showSymmetryPanel && (
+                    {showReflectionPanel && (
                       <button
-                        onClick={() => setShowSymmetryPanel(false)}
+                        onClick={() => setShowReflectionPanel(false)}
                         className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
-                        title="Close Symmetry Inspector"
+                        title="Close Reflection Inspector"
                       >
                         ✕
                       </button>
@@ -3786,109 +4511,500 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                   </div>
                 </div>
 
-                {/* Expanded Symmetry Inspector Controls */}
-                {showSymmetryPanel && (
+                {/* Expanded Reflection Inspector Controls */}
+                {showReflectionPanel && (
                   <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
-                    {/* Axis Center Info */}
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-slate-400 text-[11px]">Axis Center:</span>
-                      <span className="font-mono text-indigo-200 font-bold bg-slate-800/90 px-2 py-0.5 rounded border border-slate-700/80 text-[11px]">
-                        X: {effectiveSymmetryAxisX}px
-                      </span>
-                    </div>
-
-                    {/* Mode Selector: Metric Center vs Canvas Center */}
-                    <div className="flex items-center gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px]">
-                      <button
-                        onClick={() => setSymmetryAxisMode('metric')}
-                        className={`flex-1 py-1 px-1.5 rounded font-medium transition-all ${
-                          symmetryAxisMode === 'metric'
-                            ? 'bg-indigo-600 text-white shadow-xs font-semibold'
-                            : 'text-slate-400 hover:text-slate-200'
-                        }`}
-                        title="Metric Center: Centers axis between character left and right side bearings"
-                      >
-                        Glyph Center ({Math.round(CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36)}px)
-                      </button>
-                      <button
-                        onClick={() => setSymmetryAxisMode('canvas')}
-                        className={`flex-1 py-1 px-1.5 rounded font-medium transition-all ${
-                          symmetryAxisMode === 'canvas'
-                            ? 'bg-indigo-600 text-white shadow-xs font-semibold'
-                            : 'text-slate-400 hover:text-slate-200'
-                        }`}
-                        title="Canvas Center: Uses geometric 400px center of canvas"
-                      >
-                        Canvas 400px
-                      </button>
-                    </div>
-
-                    {/* Axis Nudge Offset */}
-                    <div className="flex items-center justify-between gap-1.5 bg-slate-800/60 px-2 py-1.5 rounded-lg border border-slate-700/60 text-[11px]">
-                      <span className="text-slate-400">Axis Nudge:</span>
-                      <div className="flex items-center gap-1">
+                    {/* Reflection Mode Segmented Tabs */}
+                    <div>
+                      <div className="text-[10px] text-slate-400 font-medium mb-1">Mirroring Axis Mode:</div>
+                      <div className="grid grid-cols-3 gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px]">
                         <button
-                          onClick={() => setSymmetryAxisOffset((prev) => prev - 2)}
-                          className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[10px]"
-                          title="Nudge axis 2px left"
+                          onClick={() =>
+                            setReflectionSettings((prev) => ({
+                              ...prev,
+                              type: 'horizontal',
+                              enabled: true,
+                            }))
+                          }
+                          className={`py-1 px-1 rounded font-medium transition-all text-center flex flex-col items-center gap-0.5 ${
+                            reflectionSettings.type === 'horizontal'
+                              ? 'bg-indigo-600 text-white shadow-xs font-semibold ring-1 ring-indigo-400/50'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Horizontal Reflection (Left ↔ Right): Mirrors across vertical axis X for characters like A, H, M, O, T, U, V, W, X, Y"
                         >
-                          -2px
+                          <div className="flex items-center gap-1 font-bold">
+                            <MoveHorizontal className="w-3 h-3 text-indigo-300" />
+                            <span>Horizontal</span>
+                          </div>
+                          <span className="text-[9px] opacity-80">Left ↔ Right</span>
                         </button>
-                        <span className="font-mono text-slate-300 w-9 text-center text-[10px]">
-                          {symmetryAxisOffset > 0 ? `+${symmetryAxisOffset}` : symmetryAxisOffset}px
+                        <button
+                          onClick={() =>
+                            setReflectionSettings((prev) => ({
+                              ...prev,
+                              type: 'vertical',
+                              enabled: true,
+                            }))
+                          }
+                          className={`py-1 px-1 rounded font-medium transition-all text-center flex flex-col items-center gap-0.5 ${
+                            reflectionSettings.type === 'vertical'
+                              ? 'bg-purple-600 text-white shadow-xs font-semibold ring-1 ring-purple-400/50'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Vertical Reflection (Top ↕ Bottom): Mirrors across horizontal axis Y for characters like B, C, D, E, H, I, K, O, X, -"
+                        >
+                          <div className="flex items-center gap-1 font-bold">
+                            <Sliders className="w-3 h-3 text-purple-300 rotate-90" />
+                            <span>Vertical</span>
+                          </div>
+                          <span className="text-[9px] opacity-80">Top ↕ Bottom</span>
+                        </button>
+                        <button
+                          onClick={() =>
+                            setReflectionSettings((prev) => ({
+                              ...prev,
+                              type: 'quad',
+                              enabled: true,
+                            }))
+                          }
+                          className={`py-1 px-1 rounded font-medium transition-all text-center flex flex-col items-center gap-0.5 ${
+                            reflectionSettings.type === 'quad'
+                              ? 'bg-fuchsia-600 text-white shadow-xs font-semibold ring-1 ring-fuchsia-400/50'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Quad 4-Way Reflection: Dual-axis simultaneous reflection across both vertical and horizontal axes for H, I, O, X, 0, 8, +"
+                        >
+                          <div className="flex items-center gap-1 font-bold">
+                            <Crosshair className="w-3 h-3 text-fuchsia-300" />
+                            <span>Quad (4-Way)</span>
+                          </div>
+                          <span className="text-[9px] opacity-80">Dual Axes</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Optical Balance Analyzer Card */}
+                    <div className="p-2 bg-slate-800/80 rounded-lg border border-slate-700/80 space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <div className="flex items-center gap-1 font-semibold text-indigo-300">
+                          <Activity className="w-3 h-3 text-indigo-400" />
+                          <span>Character Optical Balance</span>
+                        </div>
+                        <span
+                          className={`font-mono text-[9px] font-bold px-1.5 py-0.2 rounded border ${
+                            characterBalanceMetrics.overallBalanceScore >= 85
+                              ? 'bg-emerald-950/70 text-emerald-300 border-emerald-500/50'
+                              : characterBalanceMetrics.overallBalanceScore >= 70
+                              ? 'bg-amber-950/70 text-amber-300 border-amber-500/50'
+                              : 'bg-rose-950/70 text-rose-300 border-rose-500/50'
+                          }`}
+                        >
+                          {characterBalanceMetrics.overallBalanceScore}% · {characterBalanceMetrics.balanceRating}
                         </span>
-                        <button
-                          onClick={() => setSymmetryAxisOffset((prev) => prev + 2)}
-                          className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[10px]"
-                          title="Nudge axis 2px right"
-                        >
-                          +2px
-                        </button>
-                        {symmetryAxisOffset !== 0 && (
+                      </div>
+
+                      {/* Score Bars */}
+                      <div className="grid grid-cols-2 gap-2 text-[10px]">
+                        <div>
+                          <div className="flex items-center justify-between text-[9px] text-slate-400 font-mono mb-0.5">
+                            <span>↔ Horiz Sym</span>
+                            <span className="text-indigo-200 font-bold">
+                              {characterBalanceMetrics.horizontalBalanceScore}%
+                            </span>
+                          </div>
+                          <div className="h-1.5 w-full bg-slate-900 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-indigo-500 rounded-full transition-all duration-300"
+                              style={{ width: `${characterBalanceMetrics.horizontalBalanceScore}%` }}
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <div className="flex items-center justify-between text-[9px] text-slate-400 font-mono mb-0.5">
+                            <span>↕ Vert Sym</span>
+                            <span className="text-purple-200 font-bold">
+                              {characterBalanceMetrics.verticalBalanceScore}%
+                            </span>
+                          </div>
+                          <div className="h-1.5 w-full bg-slate-900 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-purple-500 rounded-full transition-all duration-300"
+                              style={{ width: `${characterBalanceMetrics.verticalBalanceScore}%` }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Mass Distribution Row */}
+                      <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-700/60 text-[9px] font-mono text-slate-300">
+                        <div className="bg-slate-900/60 p-1 rounded">
+                          <span className="text-slate-400 block text-[8px] uppercase">L / R Mass</span>
+                          <span>
+                            {characterBalanceMetrics.leftPointWeight}% L ·{' '}
+                            {characterBalanceMetrics.rightPointWeight}% R
+                          </span>
+                        </div>
+                        <div className="bg-slate-900/60 p-1 rounded">
+                          <span className="text-slate-400 block text-[8px] uppercase">T / B Mass</span>
+                          <span>
+                            {characterBalanceMetrics.topPointWeight}% T ·{' '}
+                            {characterBalanceMetrics.bottomPointWeight}% B
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Optical Balance Recommendation */}
+                      <div className="text-[9px] text-slate-400 italic bg-slate-900/40 p-1 rounded">
+                        💡 {characterBalanceMetrics.recommendation}
+                      </div>
+                    </div>
+
+                    {/* Vertical Reflection Axis X Placement (for Horizontal / Quad mode) */}
+                    {(reflectionSettings.type === 'horizontal' || reflectionSettings.type === 'quad') && (
+                      <div className="space-y-1 bg-slate-800/60 p-2 rounded-lg border border-slate-700/60">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-indigo-300 font-semibold">Vertical Axis X (L ↔ R):</span>
+                          <span className="font-mono text-indigo-200 font-bold bg-slate-900 px-1.5 py-0.5 rounded text-[10px]">
+                            {reflectionAxisX}px
+                          </span>
+                        </div>
+
+                        {/* Preset Placement Buttons */}
+                        <div className="grid grid-cols-2 gap-1 text-[10px]">
                           <button
-                            onClick={() => setSymmetryAxisOffset(0)}
-                            className="text-[10px] text-indigo-400 hover:text-indigo-300 underline ml-1"
-                            title="Reset axis offset to 0"
+                            onClick={() =>
+                              setReflectionSettings((prev) => ({
+                                ...prev,
+                                horizontalAxisMode: 'metric',
+                                horizontalAxisOffset: 0,
+                              }))
+                            }
+                            className={`py-0.5 px-1 rounded transition-colors text-center ${
+                              reflectionSettings.horizontalAxisMode === 'metric' &&
+                              reflectionSettings.horizontalAxisOffset === 0
+                                ? 'bg-indigo-600 text-white font-semibold'
+                                : 'bg-slate-700/80 text-slate-300 hover:text-white'
+                            }`}
+                            title="Metric Glyph Center: centers between character side bearings"
                           >
-                            Reset
+                            Glyph Center ({Math.round(CANVAS_ORIGIN_X + (currentGlyph.advanceWidth || 600) * 0.36)}px)
                           </button>
-                        )}
+                          <button
+                            onClick={() =>
+                              setReflectionSettings((prev) => ({
+                                ...prev,
+                                horizontalAxisMode: 'canvas',
+                                horizontalAxisOffset: 0,
+                              }))
+                            }
+                            className={`py-0.5 px-1 rounded transition-colors text-center ${
+                              reflectionSettings.horizontalAxisMode === 'canvas' &&
+                              reflectionSettings.horizontalAxisOffset === 0
+                                ? 'bg-indigo-600 text-white font-semibold'
+                                : 'bg-slate-700/80 text-slate-300 hover:text-white'
+                            }`}
+                            title="Canvas Center: geometric 400px line"
+                          >
+                            Canvas 400px
+                          </button>
+                        </div>
+
+                        {/* Axis X Nudge Offset */}
+                        <div className="flex items-center justify-between gap-1 text-[10px] pt-1">
+                          <span className="text-slate-400">Nudge X:</span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() =>
+                                setReflectionSettings((prev) => ({
+                                  ...prev,
+                                  horizontalAxisOffset: prev.horizontalAxisOffset - 2,
+                                }))
+                              }
+                              className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[9px]"
+                              title="Nudge axis 2px left"
+                            >
+                              -2px
+                            </button>
+                            <span className="font-mono text-indigo-300 w-10 text-center text-[10px]">
+                              {reflectionSettings.horizontalAxisOffset > 0
+                                ? `+${reflectionSettings.horizontalAxisOffset}`
+                                : reflectionSettings.horizontalAxisOffset}px
+                            </span>
+                            <button
+                              onClick={() =>
+                                setReflectionSettings((prev) => ({
+                                  ...prev,
+                                  horizontalAxisOffset: prev.horizontalAxisOffset + 2,
+                                }))
+                              }
+                              className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[9px]"
+                              title="Nudge axis 2px right"
+                            >
+                              +2px
+                            </button>
+                            {reflectionSettings.horizontalAxisOffset !== 0 && (
+                              <button
+                                onClick={() =>
+                                  setReflectionSettings((prev) => ({
+                                    ...prev,
+                                    horizontalAxisOffset: 0,
+                                  }))
+                                }
+                                className="text-[9px] text-indigo-400 hover:text-indigo-300 underline ml-1"
+                                title="Reset axis offset"
+                              >
+                                Reset
+                              </button>
+                            )}
+                          </div>
+                        </div>
                       </div>
+                    )}
+
+                    {/* Horizontal Reflection Axis Y Placement (for Vertical / Quad mode) */}
+                    {(reflectionSettings.type === 'vertical' || reflectionSettings.type === 'quad') && (
+                      <div className="space-y-1 bg-slate-800/60 p-2 rounded-lg border border-slate-700/60">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-purple-300 font-semibold">Horizontal Axis Y (T ↕ B):</span>
+                          <span className="font-mono text-purple-200 font-bold bg-slate-900 px-1.5 py-0.5 rounded text-[10px]">
+                            {reflectionAxisY}px
+                          </span>
+                        </div>
+
+                        {/* Preset Placement Buttons */}
+                        <div className="grid grid-cols-3 gap-1 text-[9px]">
+                          <button
+                            onClick={() =>
+                              setReflectionSettings((prev) => ({
+                                ...prev,
+                                verticalAxisMode: 'typographic',
+                                verticalAxisOffset: 0,
+                              }))
+                            }
+                            className={`py-0.5 px-1 rounded transition-colors text-center ${
+                              reflectionSettings.verticalAxisMode === 'typographic' &&
+                              reflectionSettings.verticalAxisOffset === 0
+                                ? 'bg-purple-600 text-white font-semibold'
+                                : 'bg-slate-700/80 text-slate-300 hover:text-white'
+                            }`}
+                            title="Typographic Center: mid-point between Cap-Height and Baseline"
+                          >
+                            Typographic ({Math.round((guideConfig.capHeight + guideConfig.baseline) / 2)}px)
+                          </button>
+                          <button
+                            onClick={() =>
+                              setReflectionSettings((prev) => ({
+                                ...prev,
+                                verticalAxisMode: 'baseline',
+                                verticalAxisOffset: 0,
+                              }))
+                            }
+                            className={`py-0.5 px-1 rounded transition-colors text-center ${
+                              reflectionSettings.verticalAxisMode === 'baseline' &&
+                              reflectionSettings.verticalAxisOffset === 0
+                                ? 'bg-purple-600 text-white font-semibold'
+                                : 'bg-slate-700/80 text-slate-300 hover:text-white'
+                            }`}
+                            title="Baseline: horizontal baseline level"
+                          >
+                            Baseline ({guideConfig.baseline}px)
+                          </button>
+                          <button
+                            onClick={() =>
+                              setReflectionSettings((prev) => ({
+                                ...prev,
+                                verticalAxisMode: 'canvas',
+                                verticalAxisOffset: 0,
+                              }))
+                            }
+                            className={`py-0.5 px-1 rounded transition-colors text-center ${
+                              reflectionSettings.verticalAxisMode === 'canvas' &&
+                              reflectionSettings.verticalAxisOffset === 0
+                                ? 'bg-purple-600 text-white font-semibold'
+                                : 'bg-slate-700/80 text-slate-300 hover:text-white'
+                            }`}
+                            title="Canvas Center: 400px horizontal line"
+                          >
+                            Canvas 400px
+                          </button>
+                        </div>
+
+                        {/* Axis Y Nudge Offset */}
+                        <div className="flex items-center justify-between gap-1 text-[10px] pt-1">
+                          <span className="text-slate-400">Nudge Y:</span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() =>
+                                setReflectionSettings((prev) => ({
+                                  ...prev,
+                                  verticalAxisOffset: prev.verticalAxisOffset - 2,
+                                }))
+                              }
+                              className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[9px]"
+                              title="Nudge axis 2px up"
+                            >
+                              -2px
+                            </button>
+                            <span className="font-mono text-purple-300 w-10 text-center text-[10px]">
+                              {reflectionSettings.verticalAxisOffset > 0
+                                ? `+${reflectionSettings.verticalAxisOffset}`
+                                : reflectionSettings.verticalAxisOffset}px
+                            </span>
+                            <button
+                              onClick={() =>
+                                setReflectionSettings((prev) => ({
+                                  ...prev,
+                                  verticalAxisOffset: prev.verticalAxisOffset + 2,
+                                }))
+                              }
+                              className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[9px]"
+                              title="Nudge axis 2px down"
+                            >
+                              +2px
+                            </button>
+                            {reflectionSettings.verticalAxisOffset !== 0 && (
+                              <button
+                                onClick={() =>
+                                  setReflectionSettings((prev) => ({
+                                    ...prev,
+                                    verticalAxisOffset: 0,
+                                  }))
+                                }
+                                className="text-[9px] text-purple-400 hover:text-purple-300 underline ml-1"
+                                title="Reset axis offset"
+                              >
+                                Reset
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Bounding Box Snap & Visual Overlay Toggles */}
+                    <div className="flex items-center justify-between text-[10px] bg-slate-800/40 p-1.5 rounded-lg border border-slate-700/40">
+                      <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                        <input
+                          type="checkbox"
+                          checked={reflectionSettings.lockAxesToBoundingBoxCenter ?? false}
+                          onChange={(e) =>
+                            setReflectionSettings((prev) => ({
+                              ...prev,
+                              lockAxesToBoundingBoxCenter: e.target.checked,
+                            }))
+                          }
+                          className="accent-indigo-500 rounded"
+                        />
+                        <span>Lock to Bounding Box Center</span>
+                      </label>
+                      <button
+                        onClick={() =>
+                          setReflectionSettings((prev) => ({
+                            ...prev,
+                            showGhostReticle: !prev.showGhostReticle,
+                          }))
+                        }
+                        className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${
+                          reflectionSettings.showGhostReticle
+                            ? 'bg-indigo-950/70 border-indigo-500/80 text-indigo-200'
+                            : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'
+                        }`}
+                        title="Toggle live ghost mirror reticle preview while hovering pen cursor"
+                      >
+                        Ghost Reticles
+                      </button>
                     </div>
 
-                    {/* One-Click Half-Stroke Mirroring */}
-                    <div className="pt-2 border-t border-slate-800">
-                      <div className="text-[10px] text-slate-400 mb-1.5 font-medium">
-                        One-Click Half Mirror (Draw half, then mirror):
+                    {/* One-Click Post-Drawing Reflection Tools */}
+                    <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] text-slate-300 font-semibold">
+                        <span>One-Click Half-Stroke Reflection:</span>
+                        <span className="text-[9px] text-slate-400 font-normal">Undoable</span>
                       </div>
-                      <div className="grid grid-cols-2 gap-1.5">
-                        <button
-                          onClick={() => handleMirrorSide('left')}
-                          disabled={currentStrokes.length === 0}
-                          className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 text-[10px] font-semibold border border-slate-700 transition-colors"
-                          title="Duplicate and mirror left half to right side"
-                        >
-                          <span>Left ➔ Right</span>
-                        </button>
-                        <button
-                          onClick={() => handleMirrorSide('right')}
-                          disabled={currentStrokes.length === 0}
-                          className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 text-[10px] font-semibold border border-slate-700 transition-colors"
-                          title="Duplicate and mirror right half to left side"
-                        >
-                          <span>Right ➔ Left</span>
-                        </button>
-                      </div>
+
+                      {/* Horizontal half reflection buttons */}
+                      {(reflectionSettings.type === 'horizontal' || reflectionSettings.type === 'quad') && (
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <button
+                            onClick={() => handleMirrorHalf('left-to-right')}
+                            disabled={currentStrokes.length === 0}
+                            className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                            title="Mirror Left half strokes to Right side across vertical axis X"
+                          >
+                            <span>Left ➔ Right (↔)</span>
+                          </button>
+                          <button
+                            onClick={() => handleMirrorHalf('right-to-left')}
+                            disabled={currentStrokes.length === 0}
+                            className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/40 text-indigo-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                            title="Mirror Right half strokes to Left side across vertical axis X"
+                          >
+                            <span>Right ➔ Left (↔)</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Vertical half reflection buttons */}
+                      {(reflectionSettings.type === 'vertical' || reflectionSettings.type === 'quad') && (
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <button
+                            onClick={() => handleMirrorHalf('top-to-bottom')}
+                            disabled={currentStrokes.length === 0}
+                            className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/40 text-purple-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                            title="Mirror Top half strokes to Bottom side across horizontal axis Y"
+                          >
+                            <span>Top ➔ Bottom (↕)</span>
+                          </button>
+                          <button
+                            onClick={() => handleMirrorHalf('bottom-to-top')}
+                            disabled={currentStrokes.length === 0}
+                            className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/40 text-purple-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                            title="Mirror Bottom half strokes to Top side across horizontal axis Y"
+                          >
+                            <span>Bottom ➔ Top (↕)</span>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Reflect All Strokes Button */}
+                      <button
+                        onClick={() => handleReflectAllStrokes()}
+                        disabled={currentStrokes.length === 0}
+                        className="w-full flex items-center justify-center gap-1.5 py-1 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95"
+                        title="Duplicate and reflect all active strokes across the configured reflection axes"
+                      >
+                        <Copy className="w-3 h-3 text-indigo-400" />
+                        <span>Reflect All Strokes Across Active Axes</span>
+                      </button>
                     </div>
 
-                    {/* Symmetrical Character Quick Select */}
+                    {/* Symmetrical Character Quick Select Presets */}
                     <div className="pt-2 border-t border-slate-800">
                       <div className="text-[10px] text-slate-400 mb-1.5 font-medium flex items-center justify-between">
-                        <span>Symmetrical Letters:</span>
-                        <span className="text-[9px] text-indigo-300">e.g. O, A, M, H</span>
+                        <span>
+                          {reflectionSettings.type === 'horizontal'
+                            ? 'Horizontal Symmetrical Letters:'
+                            : reflectionSettings.type === 'vertical'
+                            ? 'Vertical Symmetrical Letters:'
+                            : 'Quad (Dual-Axis) Symmetrical:'}
+                        </span>
+                        <span className="text-[9px] text-indigo-300 font-mono">
+                          {reflectionSettings.type === 'horizontal'
+                            ? 'A, H, M, O, T...'
+                            : reflectionSettings.type === 'vertical'
+                            ? 'B, C, D, E, K...'
+                            : 'H, I, O, X, 0, 8...'}
+                        </span>
                       </div>
                       <div className="flex flex-wrap gap-1">
-                        {SYMMETRY_PRESET_CHARS.map((char) => (
+                        {(reflectionSettings.type === 'horizontal'
+                          ? HORIZONTAL_SYMMETRY_PRESETS
+                          : reflectionSettings.type === 'vertical'
+                          ? VERTICAL_SYMMETRY_PRESETS
+                          : QUAD_SYMMETRY_PRESETS
+                        ).map((char) => (
                           <button
                             key={char}
                             onClick={() => onSelectChar(char)}
@@ -3903,6 +5019,952 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
                           </button>
                         ))}
                       </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Floating Snap to Grid HUD Card */}
+            {(gridSettings.enabled || showGridConfigPanel) && (
+              <div
+                className={`absolute ${
+                  underlay.src && underlay.visible ? 'top-14' : 'top-2.5'
+                } right-2.5 z-20 bg-slate-900/95 backdrop-blur-md border border-indigo-500/50 rounded-xl ${
+                  showGridConfigPanel ? 'p-3 max-w-[310px]' : 'py-1.5 px-3 max-w-fit'
+                } text-white shadow-xl w-full animate-in fade-in slide-in-from-top-1 duration-200 select-none`}
+              >
+                <div
+                  className={`flex items-center justify-between gap-2.5 ${
+                    showGridConfigPanel ? 'mb-2 pb-1.5 border-b border-slate-800' : ''
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-300">
+                    <Magnet className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>
+                      Snap to Grid{' '}
+                      {showGridConfigPanel
+                        ? `(${gridSettings.gridSize}px Pitch)`
+                        : `[${gridSettings.gridSize}px]`}
+                    </span>
+                    {currentStrokes.length > 0 && (
+                      <span className="px-1.5 py-0.2 rounded bg-indigo-950 border border-indigo-500/60 text-indigo-300 text-[10px] font-mono">
+                        {gridAlignmentMetrics.alignmentPercentage}%
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() =>
+                        setGridSettings((prev) => ({ ...prev, enabled: !prev.enabled }))
+                      }
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded transition-colors ${
+                        gridSettings.enabled
+                          ? 'bg-indigo-600 text-white shadow-2xs'
+                          : 'bg-slate-800 text-slate-300 hover:text-white'
+                      }`}
+                      title="Toggle Snap to Grid [X]"
+                    >
+                      {gridSettings.enabled ? 'Active [X]' : 'Off [X]'}
+                    </button>
+                    <button
+                      onClick={() => setShowGridConfigPanel((prev) => !prev)}
+                      className={`p-1 rounded text-xs transition-colors ${
+                        showGridConfigPanel
+                          ? 'bg-indigo-700 text-white'
+                          : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      title={showGridConfigPanel ? 'Collapse Grid Settings' : 'Expand Grid Settings'}
+                    >
+                      <Sliders className="w-3 h-3" />
+                    </button>
+                    {showGridConfigPanel && (
+                      <button
+                        onClick={() => setShowGridConfigPanel(false)}
+                        className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
+                        title="Close Grid Inspector"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {showGridConfigPanel && (
+                  <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
+                    {/* Alignment Stats */}
+                    <div className="bg-slate-800/80 rounded-lg p-2 border border-slate-700/80 flex items-center justify-between">
+                      <div>
+                        <span className="text-slate-400 text-[10px] block">Aligned Endpoints</span>
+                        <span className="font-mono font-bold text-indigo-200 text-xs">
+                          {gridAlignmentMetrics.alignedEndpoints} of {gridAlignmentMetrics.totalEndpoints} endpoints
+                        </span>
+                      </div>
+                      <span className="font-mono font-extrabold text-sm text-indigo-300 bg-indigo-950 px-2 py-0.5 rounded border border-indigo-700">
+                        {gridAlignmentMetrics.alignmentPercentage}%
+                      </span>
+                    </div>
+
+                    {/* Pitch Presets */}
+                    <div>
+                      <div className="text-[10px] text-slate-400 font-medium mb-1">
+                        Grid Pitch (Pixels):
+                      </div>
+                      <div className="grid grid-cols-4 gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px] font-mono">
+                        {[10, 20, 40, 50].map((size) => (
+                          <button
+                            key={size}
+                            onClick={() =>
+                              setGridSettings((prev) => ({ ...prev, gridSize: size }))
+                            }
+                            className={`py-1 px-1 rounded font-semibold text-center transition-all ${
+                              gridSettings.gridSize === size
+                                ? 'bg-indigo-600 text-white shadow-2xs font-bold'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            {size}px
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Custom Grid Pitch Slider */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                        <span>Pitch Scale:</span>
+                        <span className="text-indigo-300 font-bold">{gridSettings.gridSize}px</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="8"
+                        max="100"
+                        step="2"
+                        value={gridSettings.gridSize}
+                        onChange={(e) =>
+                          setGridSettings((prev) => ({
+                            ...prev,
+                            gridSize: parseInt(e.target.value),
+                          }))
+                        }
+                        className="w-full accent-indigo-500 cursor-pointer h-1.5"
+                        title="Adjust grid spacing in canvas pixels"
+                      />
+                    </div>
+
+                    {/* Magnetic Snap Radius Slider */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                        <span>Magnetic Snap Radius:</span>
+                        <span className="text-indigo-300 font-bold">
+                          {gridSettings.magneticThreshold}px
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="6"
+                        max="40"
+                        step="2"
+                        value={gridSettings.magneticThreshold}
+                        onChange={(e) =>
+                          setGridSettings((prev) => ({
+                            ...prev,
+                            magneticThreshold: parseInt(e.target.value),
+                          }))
+                        }
+                        className="w-full accent-indigo-500 cursor-pointer h-1.5"
+                        title="Snap radius: endpoints within this pixel distance magnetically attract to grid vertices"
+                      />
+                    </div>
+
+                    {/* Snap Targets: Endpoints Only vs All Points */}
+                    <div className="pt-1.5 border-t border-slate-800">
+                      <div className="flex items-center justify-between text-[10px] mb-1">
+                        <span className="text-slate-400 font-medium">Alignment Scope:</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px]">
+                        <button
+                          onClick={() =>
+                            setGridSettings((prev) => ({ ...prev, snapEndpointsOnly: true }))
+                          }
+                          className={`py-1 px-1.5 rounded font-semibold text-center transition-all ${
+                            gridSettings.snapEndpointsOnly
+                              ? 'bg-indigo-600 text-white shadow-2xs'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Snap stroke start and end points only (preserves freehand curvature in curve interiors)"
+                        >
+                          Endpoints Only
+                        </button>
+                        <button
+                          onClick={() =>
+                            setGridSettings((prev) => ({ ...prev, snapEndpointsOnly: false }))
+                          }
+                          className={`py-1 px-1.5 rounded font-semibold text-center transition-all ${
+                            !gridSettings.snapEndpointsOnly
+                              ? 'bg-indigo-600 text-white shadow-2xs'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                          title="Snap all stroke points (creates rigid geometric or pixel-grid characters)"
+                        >
+                          All Points
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Visual Overlay Toggles */}
+                    <div className="flex items-center justify-between text-[10px] pt-1">
+                      <label className="flex items-center gap-1.5 cursor-pointer text-slate-300">
+                        <input
+                          type="checkbox"
+                          checked={gridSettings.showGridLines}
+                          onChange={(e) =>
+                            setGridSettings((prev) => ({
+                              ...prev,
+                              showGridLines: e.target.checked,
+                            }))
+                          }
+                          className="rounded border-slate-700 bg-slate-800 text-indigo-500 focus:ring-0"
+                        />
+                        <span>Grid Lines</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer text-slate-300">
+                        <input
+                          type="checkbox"
+                          checked={gridSettings.showIntersectionDots}
+                          onChange={(e) =>
+                            setGridSettings((prev) => ({
+                              ...prev,
+                              showIntersectionDots: e.target.checked,
+                            }))
+                          }
+                          className="rounded border-slate-700 bg-slate-800 text-indigo-500 focus:ring-0"
+                        />
+                        <span>Intersection Dots</span>
+                      </label>
+                    </div>
+
+                    {/* One-Click Action: Snap All Endpoints of Active Character */}
+                    <div className="pt-2 border-t border-slate-800">
+                      <button
+                        onClick={handleSnapGlyphEndpoints}
+                        disabled={currentStrokes.length === 0}
+                        className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-md active:scale-95 cursor-pointer"
+                        title="Snap all stroke endpoints in the active character to the nearest grid intersection"
+                      >
+                        <Magnet className="w-3.5 h-3.5" />
+                        <span>Snap '{currentChar}' Endpoints to Grid</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Floating Ghost Template (Standard Latin Tracing Guide) HUD Card on Canvas */}
+            {(tracingGuide.enabled || showTracingGuidePanel) && (
+              <div
+                className={`absolute ${
+                  showPressureHeatmap
+                    ? isPressureHUDCollapsed
+                      ? 'top-14 left-2.5'
+                      : 'top-14 left-2.5'
+                    : reflectionSettings.enabled || showReflectionPanel
+                    ? 'top-14 left-2.5'
+                    : 'top-2.5 left-2.5'
+                } z-20 bg-slate-900/95 backdrop-blur-md border border-sky-500/50 rounded-xl ${
+                  showTracingGuidePanel ? 'p-3 max-w-[340px]' : 'py-1.5 px-3 max-w-fit'
+                } text-white shadow-xl w-full animate-in fade-in slide-in-from-top-1 duration-200 select-none max-h-[85vh] overflow-y-auto`}
+              >
+                {/* Header Row */}
+                <div
+                  className={`flex items-center justify-between gap-2.5 ${
+                    showTracingGuidePanel ? 'mb-2 pb-1.5 border-b border-slate-800' : ''
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-sky-300">
+                    <Ghost className="w-3.5 h-3.5 text-sky-400" />
+                    <span>
+                      Ghost Template{' '}
+                      {showTracingGuidePanel
+                        ? '· Latin Tracing Guide'
+                        : `'${currentChar}' · ${Math.round(tracingGuide.opacity * 100)}%`}
+                    </span>
+                    {tracingGuide.enabled && (
+                      <span className="px-1.5 py-0.2 rounded bg-sky-950 border border-sky-500/60 text-sky-300 text-[10px] font-mono font-bold">
+                        {Math.round(tracingGuide.opacity * 100)}%
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() =>
+                        setTracingGuide((prev) => {
+                          const next = !prev.enabled;
+                          setBeautifyNotice(
+                            next
+                              ? `Ghost Template ON: Tracing '${currentChar}' standard Latin form [T]`
+                              : 'Ghost Template OFF [T]'
+                          );
+                          setTimeout(() => setBeautifyNotice(null), 2000);
+                          return { ...prev, enabled: next };
+                        })
+                      }
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded transition-colors ${
+                        tracingGuide.enabled
+                          ? 'bg-sky-600 text-white shadow-2xs'
+                          : 'bg-slate-800 text-slate-300 hover:text-white'
+                      }`}
+                      title="Toggle Ghost Template overlay on canvas [T]"
+                    >
+                      {tracingGuide.enabled ? 'Active [T]' : 'Off [T]'}
+                    </button>
+                    <button
+                      onClick={() => setShowTracingGuidePanel((prev) => !prev)}
+                      className={`p-1 rounded text-xs transition-colors ${
+                        showTracingGuidePanel
+                          ? 'bg-sky-700 text-white'
+                          : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      title={showTracingGuidePanel ? 'Collapse Ghost Template HUD' : 'Expand Ghost Template Settings'}
+                    >
+                      <Sliders className="w-3 h-3" />
+                    </button>
+                    {showTracingGuidePanel && (
+                      <button
+                        onClick={() => setShowTracingGuidePanel(false)}
+                        className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
+                        title="Close Ghost Template Inspector"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Expanded Ghost Template Inspector Controls */}
+                {showTracingGuidePanel && (
+                  <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
+                    {/* Opacity Slider & Presets */}
+                    <div className="space-y-1.5 bg-slate-800/80 p-2.5 rounded-lg border border-slate-700/80">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-sky-300 font-semibold">Ghost Template Opacity:</span>
+                        <span className="font-mono text-sky-200 font-bold bg-slate-900 px-1.5 py-0.5 rounded text-[10px]">
+                          {Math.round(tracingGuide.opacity * 100)}%
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-4 gap-1 p-0.5 bg-slate-900/80 rounded-lg text-[10px]">
+                        {TRACING_OPACITY_PRESETS.map((preset) => {
+                          const isSel = Math.abs(tracingGuide.opacity - preset.value) < 0.05;
+                          return (
+                            <button
+                              key={preset.label}
+                              onClick={() =>
+                                setTracingGuide((prev) => ({ ...prev, opacity: preset.value, enabled: true }))
+                              }
+                              className={`py-1 px-1 rounded text-center transition-all ${
+                                isSel
+                                  ? 'bg-sky-600 text-white font-bold shadow-2xs'
+                                  : 'text-slate-400 hover:text-slate-200'
+                              }`}
+                              title={`${preset.label} (${Math.round(preset.value * 100)}%): ${preset.hint}`}
+                            >
+                              <div className="font-semibold text-[10px]">{preset.label}</div>
+                              <div className="text-[8px] opacity-80 font-mono">{Math.round(preset.value * 100)}%</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <input
+                        type="range"
+                        min="0.05"
+                        max="0.60"
+                        step="0.02"
+                        value={tracingGuide.opacity}
+                        onChange={(e) =>
+                          setTracingGuide((prev) => ({
+                            ...prev,
+                            opacity: parseFloat(e.target.value),
+                            enabled: true,
+                          }))
+                        }
+                        className="w-full accent-sky-500 cursor-pointer h-1.5"
+                        title="Adjust semi-transparent ghost opacity"
+                      />
+                      <div className="flex items-center justify-between text-[8px] font-mono text-slate-400">
+                        <span>Faint (5%)</span>
+                        <span>Balanced (22%)</span>
+                        <span>Prominent (60%)</span>
+                      </div>
+                    </div>
+
+                    {/* Standard Latin Archetype Font Selector */}
+                    <div>
+                      <div className="text-[10px] text-slate-400 font-medium mb-1">
+                        Standard Latin Archetype:
+                      </div>
+                      <div className="grid grid-cols-2 gap-1">
+                        {STANDARD_FONT_OPTIONS.map((opt) => {
+                          const isSelected = tracingGuide.fontStyle === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              onClick={() =>
+                                setTracingGuide((prev) => ({
+                                  ...prev,
+                                  fontStyle: opt.id,
+                                  enabled: true,
+                                }))
+                              }
+                              className={`p-1.5 rounded-lg border text-left transition-all ${
+                                isSelected
+                                  ? 'border-sky-500 bg-sky-950/70 text-sky-200 ring-1 ring-sky-400 shadow-2xs'
+                                  : 'border-slate-700 bg-slate-800/80 text-slate-300 hover:border-slate-600'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="font-semibold text-[11px] truncate">{opt.name}</span>
+                                {isSelected && <Check className="w-3 h-3 text-sky-400 shrink-0" />}
+                              </div>
+                              <div
+                                className="text-[14px] font-bold text-white mt-0.5 truncate tracking-wide"
+                                style={{ fontFamily: opt.fontFamily }}
+                              >
+                                {currentChar} {opt.sampleText.slice(3)}
+                              </div>
+                              <div className="text-[9px] text-slate-400 truncate mt-0.5">
+                                {opt.bestFor}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Overlay Style: Outline, Silhouette, Dual, Skeleton */}
+                    <div>
+                      <div className="text-[10px] text-slate-400 font-medium mb-1">
+                        Template Render Style:
+                      </div>
+                      <div className="grid grid-cols-4 gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px] text-center">
+                        {[
+                          { id: 'ghost-outline', label: 'Outline' },
+                          { id: 'ghost-fill', label: 'Silhouette' },
+                          { id: 'dual', label: 'Dual' },
+                          { id: 'skeleton', label: 'Skeleton' },
+                        ].map((mode) => (
+                          <button
+                            key={mode.id}
+                            onClick={() =>
+                              setTracingGuide((prev) => ({
+                                ...prev,
+                                renderMode: mode.id as TracingRenderMode,
+                                enabled: true,
+                              }))
+                            }
+                            className={`py-1 px-1 rounded transition-colors truncate ${
+                              tracingGuide.renderMode === mode.id
+                                ? 'bg-sky-600 text-white font-bold shadow-xs'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            {mode.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Quick Latin Characters Tracing Strip (A-Z, a-z) */}
+                    <div className="space-y-1.5 pt-1.5 border-t border-slate-800">
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className="text-slate-300 font-semibold flex items-center gap-1">
+                          <Type className="w-3 h-3 text-sky-400" />
+                          <span>Standard Latin Quick Jump:</span>
+                        </span>
+                        <div className="flex items-center gap-1 bg-slate-800 p-0.5 rounded">
+                          <button
+                            onClick={() => setTracingLatinCaseTab('upper')}
+                            className={`px-1.5 py-0.2 rounded text-[9px] font-mono font-bold transition-colors ${
+                              tracingLatinCaseTab === 'upper'
+                                ? 'bg-sky-600 text-white'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            A–Z
+                          </button>
+                          <button
+                            onClick={() => setTracingLatinCaseTab('lower')}
+                            className={`px-1.5 py-0.2 rounded text-[9px] font-mono font-bold transition-colors ${
+                              tracingLatinCaseTab === 'lower'
+                                ? 'bg-sky-600 text-white'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            a–z
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Horizontal character strip */}
+                      <div className="flex gap-1 overflow-x-auto pb-1 max-w-full scrollbar-thin">
+                        {(tracingLatinCaseTab === 'upper'
+                          ? STANDARD_LATIN_UPPERCASE
+                          : STANDARD_LATIN_LOWERCASE
+                        ).map((char) => {
+                          const isCurrent = currentChar === char;
+                          const hasInk = (glyphs[char]?.strokes?.length ?? 0) > 0;
+                          return (
+                            <button
+                              key={char}
+                              onClick={() => onSelectChar(char)}
+                              className={`w-6 h-6 shrink-0 rounded flex items-center justify-center font-bold text-xs font-mono transition-all ${
+                                isCurrent
+                                  ? 'bg-sky-500 text-white ring-2 ring-sky-300 shadow-xs'
+                                  : hasInk
+                                  ? 'bg-slate-800 text-emerald-300 hover:bg-slate-700'
+                                  : 'bg-slate-800/80 text-slate-400 hover:bg-slate-700 hover:text-slate-200'
+                              }`}
+                              title={`Trace '${char}' standard Latin template${hasInk ? ' (Ink drawn)' : ''}`}
+                            >
+                              {char}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Sync Slant & Visual Guides */}
+                    <div className="space-y-1.5 pt-1 border-t border-slate-800 text-[10px]">
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={tracingGuide.applySlant}
+                            onChange={(e) =>
+                              setTracingGuide((prev) => ({ ...prev, applySlant: e.target.checked }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-sky-500 focus:ring-0"
+                          />
+                          <span>Sync with Font Slant ({slant}°)</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={tracingGuide.showProportions}
+                            onChange={(e) =>
+                              setTracingGuide((prev) => ({ ...prev, showProportions: e.target.checked }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-sky-500 focus:ring-0"
+                          />
+                          <span>Width Calipers</span>
+                        </label>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={tracingGuide.showGuidelineSnaps}
+                            onChange={(e) =>
+                              setTracingGuide((prev) => ({ ...prev, showGuidelineSnaps: e.target.checked }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-sky-500 focus:ring-0"
+                          />
+                          <span>Guideline Alignment Pips</span>
+                        </label>
+
+                        {/* Guide Color Theme */}
+                        <div className="flex items-center gap-1">
+                          {(
+                            [
+                              { id: 'blueprint', dot: 'bg-sky-400' },
+                              { id: 'indigo', dot: 'bg-indigo-400' },
+                              { id: 'emerald', dot: 'bg-emerald-400' },
+                              { id: 'amber', dot: 'bg-amber-400' },
+                            ] as const
+                          ).map((t) => (
+                            <button
+                              key={t.id}
+                              onClick={() =>
+                                setTracingGuide((prev) => ({
+                                  ...prev,
+                                  colorTheme: t.id as TracingColorTheme,
+                                }))
+                              }
+                              className={`w-3.5 h-3.5 rounded-full ${t.dot} transition-transform ${
+                                tracingGuide.colorTheme === t.id
+                                  ? 'ring-2 ring-white scale-110'
+                                  : 'opacity-60 hover:opacity-100'
+                              }`}
+                              title={`${t.id} tint`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Live Proportion Matching Diagnostics */}
+                    <div className="p-2 bg-slate-800/80 rounded-lg border border-slate-700/80 space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="font-semibold text-slate-200 flex items-center gap-1">
+                          <Sparkles className="w-3 h-3 text-sky-400" />
+                          <span>Proportion Match</span>
+                        </span>
+                        {tracingProportionComparison.hasDrawnInk && (
+                          <span
+                            className={`font-mono text-[9px] font-bold px-1.5 py-0.2 rounded border ${
+                              tracingProportionComparison.overallMatchScore >= 80
+                                ? 'bg-emerald-950/70 text-emerald-300 border-emerald-500/50'
+                                : tracingProportionComparison.overallMatchScore >= 60
+                                ? 'bg-amber-950/70 text-amber-300 border-amber-500/50'
+                                : 'bg-rose-950/70 text-rose-300 border-rose-500/50'
+                            }`}
+                          >
+                            {tracingProportionComparison.overallMatchScore}% Match
+                          </span>
+                        )}
+                      </div>
+
+                      {tracingProportionComparison.hasDrawnInk ? (
+                        <>
+                          <div className="grid grid-cols-2 gap-1.5 text-[9px] font-mono text-slate-300">
+                            <div className="bg-slate-900/60 p-1 rounded">
+                              <span className="text-slate-400 block text-[8px] uppercase">Width</span>
+                              <span>
+                                {tracingProportionComparison.drawnWidth}px / {tracingProportionComparison.standardWidth}px
+                              </span>
+                            </div>
+                            <div className="bg-slate-900/60 p-1 rounded">
+                              <span className="text-slate-400 block text-[8px] uppercase">Height</span>
+                              <span>
+                                {tracingProportionComparison.drawnHeight}px / {tracingProportionComparison.standardHeight}px
+                              </span>
+                            </div>
+                          </div>
+                          <div className="text-[9px] text-slate-400 italic bg-slate-900/40 p-1 rounded leading-tight">
+                            💡 {tracingProportionComparison.feedbackTip}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="text-[9px] text-slate-400 leading-tight">
+                          Trace over the ghosted template for '{currentChar}' with your pen to match standard Latin proportions.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Floating Simplify Paths (RDP Algorithm) HUD Card on Canvas */}
+            {(simplifySettings.enabled || showSimplifyPanel) && (
+              <div
+                className={`absolute bottom-3 right-3 z-20 bg-slate-900/95 backdrop-blur-md border border-emerald-500/50 rounded-xl ${
+                  showSimplifyPanel ? 'p-3 max-w-[340px]' : 'py-1.5 px-3 max-w-fit'
+                } text-white shadow-xl w-full animate-in fade-in slide-in-from-bottom-2 duration-200 select-none max-h-[85vh] overflow-y-auto`}
+              >
+                {/* Header */}
+                <div
+                  className={`flex items-center justify-between gap-2.5 ${
+                    showSimplifyPanel ? 'mb-2 pb-1.5 border-b border-slate-800' : ''
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-300">
+                    <Scissors className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>
+                      Simplify Paths{' '}
+                      {showSimplifyPanel
+                        ? '· RDP Algorithm'
+                        : `(ε:${simplifySettings.epsilon}px)`}
+                    </span>
+                    {currentStrokes.length > 0 && simplificationMetrics.reductionPercentage > 0 && (
+                      <span className="px-1.5 py-0.2 rounded bg-emerald-950 border border-emerald-500/60 text-emerald-300 text-[10px] font-mono font-bold">
+                        -{simplificationMetrics.reductionPercentage}%
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() =>
+                        setSimplifySettings((prev) => {
+                          const next = !prev.enabled;
+                          setBeautifyNotice(
+                            next
+                              ? `Simplify Paths ON (RDP ε=${prev.epsilon}px)`
+                              : 'Simplify Paths OFF'
+                          );
+                          setTimeout(() => setBeautifyNotice(null), 2000);
+                          return { ...prev, enabled: next };
+                        })
+                      }
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded transition-colors ${
+                        simplifySettings.enabled
+                          ? 'bg-emerald-600 text-white shadow-2xs'
+                          : 'bg-slate-800 text-slate-300 hover:text-white'
+                      }`}
+                      title="Toggle Simplify Paths mode overlay"
+                    >
+                      {simplifySettings.enabled ? 'Active' : 'Off'}
+                    </button>
+                    <button
+                      onClick={() => setShowSimplifyPanel((prev) => !prev)}
+                      className={`p-1 rounded text-xs transition-colors ${
+                        showSimplifyPanel
+                          ? 'bg-emerald-700 text-white'
+                          : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                      title={showSimplifyPanel ? 'Collapse Simplify Settings' : 'Expand Simplify Settings'}
+                    >
+                      <Sliders className="w-3 h-3" />
+                    </button>
+                    {showSimplifyPanel && (
+                      <button
+                        onClick={() => setShowSimplifyPanel(false)}
+                        className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded hover:bg-slate-800"
+                        title="Close Simplify Inspector"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Expanded Simplify Settings */}
+                {showSimplifyPanel && (
+                  <div className="space-y-2.5 text-xs animate-in fade-in duration-150">
+                    {/* Live Point Reduction Scorecard */}
+                    <div className="bg-slate-800/80 rounded-lg p-2.5 border border-slate-700/80 space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-slate-300 font-semibold flex items-center gap-1">
+                          <GitCommit className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Control Points:</span>
+                        </span>
+                        <span className="font-mono text-emerald-300 font-bold text-xs">
+                          {simplificationMetrics.originalPointCount} ➔ {simplificationMetrics.simplifiedPointCount} pts
+                        </span>
+                      </div>
+
+                      {/* Visual Reduction Progress Bar */}
+                      <div className="space-y-0.5">
+                        <div className="flex items-center justify-between text-[9px] font-mono text-slate-400">
+                          <span>Original Points</span>
+                          <span className="text-emerald-300 font-bold">
+                            -{simplificationMetrics.reductionPercentage}% decimation
+                          </span>
+                        </div>
+                        <div className="h-2 w-full bg-slate-950 rounded-full overflow-hidden p-0.5 border border-slate-700">
+                          <div
+                            className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 rounded-full transition-all duration-300"
+                            style={{
+                              width: `${Math.max(
+                                5,
+                                Math.min(
+                                  100,
+                                  simplificationMetrics.originalPointCount > 0
+                                    ? (simplificationMetrics.simplifiedPointCount /
+                                        simplificationMetrics.originalPointCount) *
+                                        100
+                                    : 100
+                                )
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Diagnostics summary row */}
+                      <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-700/60 text-[9px] font-mono text-slate-300">
+                        <div className="bg-slate-900/60 p-1 rounded">
+                          <span className="text-slate-400 block text-[8px] uppercase">Max Deviation</span>
+                          <span>±{simplificationMetrics.maxDeviation}px error</span>
+                        </div>
+                        <div className="bg-slate-900/60 p-1 rounded">
+                          <span className="text-slate-400 block text-[8px] uppercase">Point Spacing</span>
+                          <span>~{simplificationMetrics.averagePointSpacing}px avg</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Tolerance (Epsilon ε) Slider & Readout */}
+                    <div className="space-y-1 bg-slate-800/60 p-2 rounded-lg border border-slate-700/60">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-emerald-300 font-semibold">Tolerance (Epsilon ε):</span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() =>
+                              setSimplifySettings((prev) => ({
+                                ...prev,
+                                epsilon: Math.max(0.5, Math.round((prev.epsilon - 0.5) * 10) / 10),
+                              }))
+                            }
+                            className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[9px]"
+                            title="Decrease tolerance by 0.5px"
+                          >
+                            -0.5
+                          </button>
+                          <span className="font-mono text-emerald-200 font-bold bg-slate-900 px-1.5 py-0.5 rounded text-[10px] w-12 text-center">
+                            {simplifySettings.epsilon.toFixed(1)}px
+                          </span>
+                          <button
+                            onClick={() =>
+                              setSimplifySettings((prev) => ({
+                                ...prev,
+                                epsilon: Math.min(20, Math.round((prev.epsilon + 0.5) * 10) / 10),
+                              }))
+                            }
+                            className="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-mono text-[9px]"
+                            title="Increase tolerance by 0.5px"
+                          >
+                            +0.5
+                          </button>
+                        </div>
+                      </div>
+
+                      <input
+                        type="range"
+                        min="0.5"
+                        max="15.0"
+                        step="0.5"
+                        value={simplifySettings.epsilon}
+                        onChange={(e) =>
+                          setSimplifySettings((prev) => ({
+                            ...prev,
+                            epsilon: parseFloat(e.target.value),
+                          }))
+                        }
+                        className="w-full accent-emerald-500 cursor-pointer h-1.5"
+                        title="Distance tolerance (epsilon): points deviating less than this from line segment chords are removed"
+                      />
+                      <div className="flex items-center justify-between text-[8px] font-mono text-slate-400">
+                        <span>0.5px (Fine)</span>
+                        <span>3.0px (Balanced)</span>
+                        <span>15.0px (Minimal)</span>
+                      </div>
+                    </div>
+
+                    {/* Presets Grid */}
+                    <div>
+                      <div className="text-[10px] text-slate-400 font-medium mb-1">
+                        Simplification Presets:
+                      </div>
+                      <div className="grid grid-cols-4 gap-1 p-0.5 bg-slate-800/90 rounded-lg text-[10px]">
+                        {SIMPLIFY_PRESETS.map((preset) => {
+                          const isSel = Math.abs(simplifySettings.epsilon - preset.epsilon) < 0.25;
+                          return (
+                            <button
+                              key={preset.id}
+                              onClick={() =>
+                                setSimplifySettings((prev) => ({
+                                  ...prev,
+                                  epsilon: preset.epsilon,
+                                }))
+                              }
+                              className={`py-1 px-1 rounded text-center transition-all ${
+                                isSel
+                                  ? 'bg-emerald-600 text-white shadow-xs font-bold'
+                                  : 'text-slate-400 hover:text-slate-200'
+                              }`}
+                              title={`${preset.label} (ε=${preset.epsilon}px): ${preset.description}. Recommended for: ${preset.recommendedFor}`}
+                            >
+                              <div className="font-semibold text-[10px]">{preset.label}</div>
+                              <div className="text-[8px] opacity-80 font-mono">{preset.epsilon}px</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Feature Toggles */}
+                    <div className="space-y-1.5 pt-1 border-t border-slate-800 text-[10px]">
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={simplifySettings.showControlPoints}
+                            onChange={(e) =>
+                              setSimplifySettings((prev) => ({
+                                ...prev,
+                                showControlPoints: e.target.checked,
+                              }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-emerald-500 focus:ring-0"
+                          />
+                          <span>Show Vector Node Anchors</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={simplifySettings.showLivePreview}
+                            onChange={(e) =>
+                              setSimplifySettings((prev) => ({
+                                ...prev,
+                                showLivePreview: e.target.checked,
+                              }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-emerald-500 focus:ring-0"
+                          />
+                          <span>Wireframe Preview</span>
+                        </label>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={simplifySettings.autoSimplifyOnDraw}
+                            onChange={(e) =>
+                              setSimplifySettings((prev) => ({
+                                ...prev,
+                                autoSimplifyOnDraw: e.target.checked,
+                              }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-emerald-500 focus:ring-0"
+                          />
+                          <span>Auto-Clean Shaky Strokes on Draw</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={simplifySettings.curveRelaxation}
+                            onChange={(e) =>
+                              setSimplifySettings((prev) => ({
+                                ...prev,
+                                curveRelaxation: e.target.checked,
+                              }))
+                            }
+                            className="rounded border-slate-700 bg-slate-800 text-emerald-500 focus:ring-0"
+                          />
+                          <span>Curve Relaxation</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                      <button
+                        onClick={() => handleApplySimplification()}
+                        disabled={currentStrokes.length === 0}
+                        className="w-full flex items-center justify-center gap-1.5 py-1.5 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-md active:scale-95 cursor-pointer"
+                        title={`Simplify '${currentChar}' paths by decimating points with distance deviation <= ${simplifySettings.epsilon}px`}
+                      >
+                        <Scissors className="w-3.5 h-3.5" />
+                        <span>
+                          Apply to '{currentChar}' (-{simplificationMetrics.reductionPercentage}%)
+                        </span>
+                      </button>
+
+                      <button
+                        onClick={handleBatchSimplifyAll}
+                        disabled={Object.keys(glyphs).length === 0}
+                        className="w-full flex items-center justify-center gap-1.5 py-1 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10px] font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-xs active:scale-95 cursor-pointer"
+                        title={`Apply Ramer-Douglas-Peucker simplification to all characters in font to clean up handwriting universally`}
+                      >
+                        <Wand2 className="w-3 h-3 text-emerald-400" />
+                        <span>Batch Simplify Entire Font ({Object.keys(glyphs).length} Glyphs)</span>
+                      </button>
                     </div>
                   </div>
                 )}
@@ -4379,19 +6441,44 @@ export const GlyphStudio: React.FC<GlyphStudioProps> = ({
               </span>
             </label>
 
-            {/* Tracing Guide Overlay Toggle */}
-            <label className="flex items-center gap-1.5 cursor-pointer select-none text-sky-700 font-medium">
-              <input
-                type="checkbox"
-                checked={tracingGuide.enabled}
-                onChange={(e) => setTracingGuide((prev) => ({ ...prev, enabled: e.target.checked }))}
-                className="rounded border-sky-300 text-sky-600 focus:ring-0"
-              />
-              <span className="flex items-center gap-1">
-                <Compass className="w-3.5 h-3.5 text-sky-500" />
-                Tracing Guide
-              </span>
-            </label>
+            {/* Ghost Template Tracing Guide Toggle & Quick Config */}
+            <div className="flex items-center gap-1.5">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none text-sky-700 font-medium">
+                <input
+                  type="checkbox"
+                  checked={tracingGuide.enabled}
+                  onChange={(e) => {
+                    setTracingGuide((prev) => ({ ...prev, enabled: e.target.checked }));
+                    setBeautifyNotice(
+                      e.target.checked
+                        ? `Ghost Template ON: Tracing '${currentChar}' standard Latin guide [T]`
+                        : 'Ghost Template OFF [T]'
+                    );
+                    setTimeout(() => setBeautifyNotice(null), 2000);
+                  }}
+                  className="rounded border-sky-300 text-sky-600 focus:ring-0"
+                />
+                <span className="flex items-center gap-1">
+                  <Ghost className="w-3.5 h-3.5 text-sky-500" />
+                  Ghost Template [T]
+                </span>
+              </label>
+
+              {tracingGuide.enabled && (
+                <button
+                  onClick={() => setShowTracingGuidePanel((prev) => !prev)}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-semibold border transition-all ${
+                    showTracingGuidePanel
+                      ? 'bg-sky-600 text-white border-sky-600 shadow-2xs'
+                      : 'bg-sky-50 text-sky-700 border-sky-200 hover:bg-sky-100'
+                  }`}
+                  title="Configure Ghost Template Archetype & Opacity [Shift+T]"
+                >
+                  <Sliders className="w-3 h-3" />
+                  <span>{Math.round(tracingGuide.opacity * 100)}%</span>
+                </button>
+              )}
+            </div>
 
             {/* Bounding Box & Metric Centerlines Toggle */}
             <label className="flex items-center gap-1.5 cursor-pointer select-none text-emerald-700 font-medium">

@@ -170,7 +170,8 @@ export default function App() {
     strokes: GlyphStroke[],
     advanceWidth?: number,
     variants?: GlyphVariant[],
-    rotation?: number
+    rotation?: number,
+    slant?: number
   ) => {
     setGlyphs((prev) => {
       const existing = prev[char] || {
@@ -190,6 +191,7 @@ export default function App() {
           advanceWidth: advanceWidth !== undefined ? advanceWidth : existing.advanceWidth,
           variants: variants !== undefined ? variants : existing.variants,
           rotation: rotation !== undefined ? rotation : (existing.rotation ?? 0),
+          slant: slant !== undefined ? slant : (existing.slant ?? 0),
           lastModified: Date.now(),
         },
       };

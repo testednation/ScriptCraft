@@ -303,6 +303,7 @@ export interface PressureOverlayOptions {
   showTremorWarnings?: boolean;
   thicknessScale?: number; // 0.8 to 2.5x magnification for visual balance inspection
   renderThicknessEnvelopes?: boolean;
+  liveCursorPt?: { x: number; y: number; pressure?: number } | null;
 }
 
 /**
@@ -548,6 +549,57 @@ export function renderPressureHeatmapLayer(
     }
   }
 
+  // 7. Live Cursor Line-Weight Reticle & Dynamic Readout
+  if (options.liveCursorPt) {
+    const curPt = options.liveCursorPt;
+    const curP = curPt.pressure ?? 1.0;
+    const curThickness = Math.max(3, baseWidth * curP * tScale);
+    const curRadius = curThickness / 2;
+    const curColor = getPressureHeatmapColor(curP, 1.0, palette);
+
+    // Dynamic width circle around cursor
+    ctx.strokeStyle = curColor;
+    ctx.lineWidth = 2.0;
+    ctx.setLineDash([3, 2]);
+    ctx.beginPath();
+    ctx.arc(curPt.x, curPt.y, Math.max(4, curRadius), 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Outer glow ring
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.lineWidth = 1.0;
+    ctx.beginPath();
+    ctx.arc(curPt.x, curPt.y, Math.max(4, curRadius) + 2.5, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Center pivot dot
+    ctx.fillStyle = curColor;
+    ctx.beginPath();
+    ctx.arc(curPt.x, curPt.y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Floating line-weight badge
+    const badgeLabel = `${Math.round(curThickness)}px · ${Math.round(curP * 100)}%`;
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const textW = ctx.measureText(badgeLabel).width;
+    const badgeX = curPt.x + Math.max(8, curRadius + 5);
+    const badgeY = curPt.y - Math.max(8, curRadius + 5);
+
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+    ctx.strokeStyle = curColor;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(badgeX - 3, badgeY - 7, textW + 8, 14, 4);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(badgeLabel, badgeX + 1, badgeY);
+  }
+
   ctx.restore();
 }
 
@@ -624,4 +676,103 @@ export function balanceStrokesPressure(
 export function boostStrokesPressureContrast(strokes: GlyphStroke[]): GlyphStroke[] {
   return balanceStrokesPressure(strokes, { contrastBoost: 1.35, targetAverage: 0.85 });
 }
+
+export interface CrossCharacterWeightMetrics {
+  currentChar: string;
+  currentAvgPressure: number;
+  currentAvgThickness: number;
+  fontAvgPressure: number;
+  fontAvgThickness: number;
+  relativeWeightRatio: number; // e.g. 1.05 = +5% heavier than font average
+  weightDifferencePercent: number; // e.g. +5 or -12
+  weightCategory: 'Light / Thin' | 'Balanced Regular' | 'Heavy / Bold';
+  comparedGlyphCount: number;
+  recommendation: string;
+  charBreakdown: { char: string; avgThickness: number; avgPressure: number; strokeCount: number }[];
+}
+
+/**
+ * Computes cross-character line-weight and stroke pressure balance across the entire font,
+ * comparing the current active glyph against all other drawn characters.
+ */
+export function computeCrossCharacterWeightDistribution(
+  glyphs: Record<string, { strokes?: GlyphStroke[] }>,
+  currentChar: string,
+  baseWidth: number = 14
+): CrossCharacterWeightMetrics {
+  const charStats: { char: string; avgThickness: number; avgPressure: number; strokeCount: number }[] = [];
+  let fontTotalPressureSum = 0;
+  let fontTotalPoints = 0;
+
+  for (const [char, glyph] of Object.entries(glyphs)) {
+    if (!glyph || !glyph.strokes || glyph.strokes.length === 0) continue;
+    let charSum = 0;
+    let charPts = 0;
+
+    for (const stroke of glyph.strokes) {
+      for (const pt of stroke) {
+        const p = pt.pressure !== undefined ? pt.pressure : 1.0;
+        charSum += p;
+        charPts++;
+      }
+    }
+
+    if (charPts > 0) {
+      const avgP = Math.round((charSum / charPts) * 100) / 100;
+      const avgThick = Math.round(avgP * baseWidth * 10) / 10;
+      charStats.push({
+        char,
+        avgThickness: avgThick,
+        avgPressure: avgP,
+        strokeCount: glyph.strokes.length,
+      });
+
+      fontTotalPressureSum += charSum;
+      fontTotalPoints += charPts;
+    }
+  }
+
+  const currentGlyphStat = charStats.find((s) => s.char === currentChar);
+  const curAvgP = currentGlyphStat ? currentGlyphStat.avgPressure : 0.85;
+  const curAvgThick = currentGlyphStat ? currentGlyphStat.avgThickness : Math.round(0.85 * baseWidth * 10) / 10;
+
+  const fontAvgP = fontTotalPoints > 0 ? Math.round((fontTotalPressureSum / fontTotalPoints) * 100) / 100 : 0.85;
+  const fontAvgThick = Math.round(fontAvgP * baseWidth * 10) / 10;
+
+  const relativeWeightRatio = fontAvgP > 0 ? Math.round((curAvgP / fontAvgP) * 100) / 100 : 1.0;
+  const diffPercent = Math.round((relativeWeightRatio - 1.0) * 100);
+
+  let category: CrossCharacterWeightMetrics['weightCategory'] = 'Balanced Regular';
+  if (diffPercent < -15) category = 'Light / Thin';
+  else if (diffPercent > 15) category = 'Heavy / Bold';
+
+  let recommendation = '';
+  if (charStats.length <= 1) {
+    recommendation = `Draw strokes for '${currentChar}' and additional characters to establish a font-wide weight baseline.`;
+  } else if (diffPercent > 20) {
+    recommendation = `'${currentChar}' is ${diffPercent}% heavier than your font average (${fontAvgThick}px). Consider lightening stroke pressure or using 'Balance Pressure'.`;
+  } else if (diffPercent < -20) {
+    recommendation = `'${currentChar}' is ${Math.abs(diffPercent)}% lighter than your font average (${fontAvgThick}px). Add downstroke pressure on main stems for optical consistency.`;
+  } else {
+    recommendation = `'${currentChar}' optical weight is well-harmonized with font average (within ±${Math.abs(diffPercent)}% of ${fontAvgThick}px).`;
+  }
+
+  // Sort breakdown by difference from font average
+  const sortedBreakdown = [...charStats].sort((a, b) => b.avgThickness - a.avgThickness);
+
+  return {
+    currentChar,
+    currentAvgPressure: curAvgP,
+    currentAvgThickness: curAvgThick,
+    fontAvgPressure: fontAvgP,
+    fontAvgThickness: fontAvgThick,
+    relativeWeightRatio,
+    weightDifferencePercent: diffPercent,
+    weightCategory: category,
+    comparedGlyphCount: charStats.length,
+    recommendation,
+    charBreakdown: sortedBreakdown,
+  };
+}
+
 
